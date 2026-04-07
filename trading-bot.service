@@ -1,0 +1,23 @@
+[Unit]
+Description=PullbackBot Swing Trading Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trading-bot
+ExecStart=/home/ubuntu/trading-bot/venv/bin/python main.py
+Restart=always
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pullbackbot
+
+# Memory limit guard for 1GB VM
+MemoryMax=800M
+MemoryHigh=600M
+
+[Install]
+WantedBy=multi-user.target
