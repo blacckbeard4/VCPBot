@@ -11,16 +11,54 @@ A fully automated swing trading bot implementing **Mark Minervini's Volatility C
 VCP (Volatility Contraction Pattern) is a price structure where a stock forms a base with **successive tightening pullbacks** — each contraction shallower than the last — culminating in a pocket-pivot breakout above the pivot high on rising volume.
 
 ```
-         Pivot ──►  ▲  BUY STOP (pivot + $0.05)
-                   / \
-    Contraction   /   \    +20% TARGET ─────────────────────
-       1 (wide)  /     \  /
-                /       \/   Contraction 2 (tighter)
-               /            /\
-Base          /            /  \  Contraction 3 (tightest <8%)
-(≥4 weeks)   /            /    \_____ STOP LOSS (low of final contraction)
-____________/            /
-                        Volume dry-up here
+  PRICE
+    │                                                    🎯 +20% TARGET
+    │                                               ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+    │                                          ▲ ──────── BUY STOP ENTRY
+    │                     Contraction 3    ───/    pivot + $0.05
+    │        Contraction 2   (<8% deep) ──/
+    │  C1      (tighter) ──/
+    │  (~25%)──/
+    │ /▔▔▔▔╲          /▔▔▔╲        /▔▔╲      /
+    │/      ╲        /     ╲      /    ╲    /   ← Breakout on
+    │        ╲      /       ╲    /      ╲  /      HIGH VOLUME
+    │         ╲    /         ╲  /        ╲/ ──── PIVOT POINT
+    │          ╲  /           ╲/
+    │           ╲/                          ╌╌╌ STOP LOSS
+    │        (~15%              (~8%)           (low of final contraction)
+    │         deep)             deep)
+    │
+    │◄────────── BASE ≥ 4 WEEKS ────────────►│
+    │
+    └─────────────────────────────────────────────────────────► TIME
+
+  VOLUME
+    │ ██                                                ██ ← Surge at breakout
+    │ ██  █                                         █  ██
+    │ ██  ██  █        █  █              █  █      ██  ██
+    │ ██  ██  ██  █   ██  ██  █  █  █  ██  ██  █  ██  ██
+    └──────────────────────────────── Drying up ──────────────────► TIME
+                                      (confirms VCP)
+```
+
+**Risk/Reward setup per trade:**
+
+```
+    ┌─────────────────────────────────────────────┐
+    │                                             │
+    │   🎯  PROFIT TARGET  (+20%)                 │
+    │        ╱                                    │
+    │       ╱  REWARD = 20%                       │
+    │      ╱                                      │
+    │─────╱──── ENTRY  (pivot + $0.05)  ──────────│  ← BUY STOP triggers here
+    │      ╲                                      │
+    │       ╲  RISK ≤ 7%                          │
+    │        ╲                                    │
+    │   🛑   STOP LOSS  (low of final contraction)│
+    │                                             │
+    │   Risk-to-Reward  ≥  1 : 2.8               │
+    │   Position sized to risk 2% of equity       │
+    └─────────────────────────────────────────────┘
 ```
 
 ---
