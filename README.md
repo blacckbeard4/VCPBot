@@ -12,33 +12,31 @@ VCP (Volatility Contraction Pattern) is a price structure where a stock forms a 
 
 ```
   PRICE
-    │                                                    🎯 +20% TARGET
-    │                                               ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
-    │                                          ▲ ──────── BUY STOP ENTRY
-    │                     Contraction 3    ───/    pivot + $0.05
-    │        Contraction 2   (<8% deep) ──/
-    │  C1      (tighter) ──/
-    │  (~25%)──/
-    │ /▔▔▔▔╲          /▔▔▔╲        /▔▔╲      /
-    │/      ╲        /     ╲      /    ╲    /   ← Breakout on
-    │        ╲      /       ╲    /      ╲  /      HIGH VOLUME
-    │         ╲    /         ╲  /        ╲/ ──── PIVOT POINT
-    │          ╲  /           ╲/
-    │           ╲/                          ╌╌╌ STOP LOSS
-    │        (~15%              (~8%)           (low of final contraction)
-    │         deep)             deep)
     │
-    │◄────────── BASE ≥ 4 WEEKS ────────────►│
-    │
-    └─────────────────────────────────────────────────────────► TIME
+    │                                                        🎯 +20% TARGET
+    │  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+    │                                                       /
+    │                                                      /  } REWARD +20%
+    │  ════════════════════════════════════════════════════  ← BUY STOP ENTRY
+    │         ╱╲                                      ╱       (pivot + $0.05)
+    │        ╱  ╲             ╱╲              ╱╲     ╱
+    │       ╱    ╲           ╱  ╲            ╱  ╲   ╱  ← Breakout on
+    │      ╱      ╲         ╱    ╲          ╱    ╲ ╱     HIGH VOLUME
+    │     ╱        ╲       ╱      ╲        ╱      ╳
+    │    ╱          ╲     ╱        ╲      ╱      ╱ ╲
+    │   ╱            ╲   ╱          ╲    ╱      ╱   ╲  } RISK ≤ 7%
+    │  ╱   C1 ~25%    ╲ ╱   C2 ~15%  ╲  ╱ C3 <8%    ╲
+    │ ╱                ╲╱             ╲╱              ─ ─ ─  STOP LOSS
+    │                                                   (low of C3)
+    │◄──────────────── BASE ≥ 4 WEEKS ─────────────────►│
+    └──────────────────────────────────────────────────────────────► TIME
 
-  VOLUME
-    │ ██                                                ██ ← Surge at breakout
-    │ ██  █                                         █  ██
-    │ ██  ██  █        █  █              █  █      ██  ██
-    │ ██  ██  ██  █   ██  ██  █  █  █  ██  ██  █  ██  ██
-    └──────────────────────────────── Drying up ──────────────────► TIME
-                                      (confirms VCP)
+  VOLUME  (contractions show dry-up → breakout shows surge)
+    │▐█▌                                                    ▐██▌
+    │▐█▌ ▐▌                                           ▐▌   ▐██▌← surge
+    │▐█▌ ▐█▌  ▐▌     ▐▌  ▐▌          ▐▌  ▐▌    ▐▌   ▐██▌  ▐██▌
+    │▐█▌ ▐█▌ ▐█▌ ▐▌ ▐█▌ ▐█▌ ▐▌ ▐▌ ▐▌▐█▌ ▐█▌ ▐▌▐██▌  ▐██▌  ▐██▌
+    └────────────────── volume drying up confirms VCP ──────────────► TIME
 ```
 
 **Risk/Reward setup per trade:**
