@@ -33,7 +33,9 @@ from config import (
     SCANNER_BATCH_SIZE, YFINANCE_RETRIES, YFINANCE_RETRY_SLEEP,
     MIN_AVG_VOLUME, MIN_PRICE, RS_MIN_RANK,
     MIN_PCT_ABOVE_52W_LOW, MAX_PCT_BELOW_52W_HIGH, MAX_SECTOR_POSITIONS,
+    FINNHUB_API_KEY,
 )
+from finnhub_client import finnhub_sector
 
 logger = logging.getLogger(__name__)
 
@@ -43,16 +45,30 @@ logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=2048)
 def _get_sector(ticker: str) -> str:
-    """Return the sector for a ticker via yfinance .info. Cached to avoid repeat calls.
+    """Return the sector for a ticker. Cached per process to avoid repeat API calls.
 
-    Returns 'Unknown' if the sector cannot be determined.
+    Tries yfinance first (richer metadata), falls back to Finnhub.
+    Returns 'Unknown' if both sources fail.
     """
+    # ── Primary: yfinance ──
     try:
         info = yf.Ticker(ticker).info
-        sector = info.get("sector") or info.get("sectorDisp") or "Unknown"
-        return str(sector)
+        sector = info.get("sector") or info.get("sectorDisp")
+        if sector:
+            return str(sector)
     except Exception:
-        return "Unknown"
+        pass
+
+    # ── Fallback: Finnhub ──
+    if FINNHUB_API_KEY:
+        try:
+            sector = finnhub_sector(ticker, FINNHUB_API_KEY)
+            if sector and sector != "Unknown":
+                return sector
+        except Exception:
+            pass
+
+    return "Unknown"
 
 
 # ─── Sector concentration filter ────────────────────────────

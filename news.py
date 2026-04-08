@@ -1,10 +1,11 @@
 """VCPBot — Earnings blackout check.
 
-Uses yfinance calendar (free, no additional API needed).
-Rejects stocks with earnings within EARNINGS_BLACKOUT_DAYS calendar days.
+Source priority:
+  1. Finnhub earnings calendar API  (reliable, dedicated endpoint)
+  2. yfinance .calendar             (fallback, scrapes Yahoo)
 
-Note: The Alpaca News keyword scan was removed — it was never called in the pipeline.
-Earnings blackout is the only active gate from this module.
+Returns 999 (= no blackout) if both sources fail — conservative default
+that lets the trade proceed rather than blocking on a data error.
 """
 
 import logging
@@ -14,7 +15,8 @@ from typing import Optional
 import yfinance as yf
 import pandas as pd
 
-from config import EARNINGS_BLACKOUT_DAYS
+from config import EARNINGS_BLACKOUT_DAYS, FINNHUB_API_KEY
+from finnhub_client import finnhub_next_earnings_days
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +27,26 @@ logger = logging.getLogger(__name__)
 def days_to_earnings(ticker: str) -> int:
     """Return the number of calendar days to next earnings.
 
-    Returns 999 if the date is unknown or if parsing fails.
+    Tries Finnhub first, falls back to yfinance.
+    Returns 999 if the date is unknown or both sources fail.
     Never raises.
     """
+    # ── Primary: Finnhub ──
+    if FINNHUB_API_KEY:
+        try:
+            days = finnhub_next_earnings_days(ticker, FINNHUB_API_KEY)
+            if days < 999:
+                logger.debug("Finnhub earnings for %s: %d days", ticker, days)
+                return days
+        except Exception as e:
+            logger.debug("Finnhub earnings failed for %s: %s", ticker, e)
+
+    # ── Fallback: yfinance ──
+    return _days_to_earnings_yfinance(ticker)
+
+
+def _days_to_earnings_yfinance(ticker: str) -> int:
+    """yfinance earnings date lookup. Returns 999 on any failure."""
     try:
         t = yf.Ticker(ticker)
         cal = t.calendar
@@ -37,16 +56,13 @@ def days_to_earnings(ticker: str) -> int:
 
         today = datetime.now().date()
 
-        # yfinance >= 0.2.x returns a dict or DataFrame
         if isinstance(cal, dict):
             earnings_dates = cal.get("Earnings Date", [])
             if not earnings_dates:
                 return 999
-            # May be a single value or list
             if not hasattr(earnings_dates, "__iter__"):
                 earnings_dates = [earnings_dates]
         elif isinstance(cal, pd.DataFrame):
-            # Older yfinance returns a DataFrame
             if "Earnings Date" in cal.columns:
                 earnings_dates = cal["Earnings Date"].tolist()
             elif len(cal.columns) > 0:
@@ -76,7 +92,7 @@ def days_to_earnings(ticker: str) -> int:
         return min_days
 
     except Exception as e:
-        logger.debug("Earnings lookup failed for %s: %s", ticker, e)
+        logger.debug("yfinance earnings lookup failed for %s: %s", ticker, e)
         return 999
 
 

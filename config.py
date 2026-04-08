@@ -16,6 +16,10 @@ ALPACA_API_KEY: str = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY: str = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_PAPER: bool = os.getenv("ALPACA_PAPER", "true").lower() in ("true", "1", "yes")
 
+# === Market Data Fallbacks ===
+FINNHUB_API_KEY: str = os.getenv("FINNHUB_API_KEY", "")
+TWELVE_DATA_API_KEY: str = os.getenv("TWELVE_DATA_API_KEY", "")
+
 # === Telegram Alerts ===
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")

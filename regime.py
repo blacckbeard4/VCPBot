@@ -34,8 +34,9 @@ import pandas_market_calendars as mcal
 from config import (
     YFINANCE_RETRIES, YFINANCE_RETRY_SLEEP, TIMEZONE,
     FTD_MIN_DAY, FTD_MAX_DAY, FTD_MIN_GAIN_PCT, FTD_DISTRIBUTION_WINDOW,
-    ALPACA_API_KEY, ALPACA_SECRET_KEY,
+    ALPACA_API_KEY, ALPACA_SECRET_KEY, TWELVE_DATA_API_KEY,
 )
+from finnhub_client import twelvedata_daily_bars
 import db
 
 logger = logging.getLogger(__name__)
@@ -348,13 +349,22 @@ def _download_index(symbol: str) -> pd.DataFrame:
         if attempt < YFINANCE_RETRIES:
             time.sleep(YFINANCE_RETRY_SLEEP)
 
-    # ── Fallback: Alpaca historical daily bars ──
-    logger.warning("%s: yfinance exhausted all retries — trying Alpaca data API", symbol)
+    # ── Fallback 2: Alpaca historical daily bars ──
+    logger.warning("%s: yfinance failed — trying Alpaca", symbol)
     df = _download_index_alpaca(symbol)
     if df is not None and len(df) >= 200:
         return df
 
-    raise RuntimeError(f"Failed to download {symbol} data after all retries (yfinance + Alpaca)")
+    # ── Fallback 3: Twelve Data ──
+    if TWELVE_DATA_API_KEY:
+        logger.warning("%s: Alpaca failed — trying Twelve Data", symbol)
+        df = twelvedata_daily_bars(symbol, TWELVE_DATA_API_KEY, days=730)
+        if df is not None and len(df) >= 200:
+            return df
+    else:
+        logger.warning("%s: TWELVE_DATA_API_KEY not set, skipping", symbol)
+
+    raise RuntimeError(f"Failed to download {symbol} data — all 3 sources exhausted (yfinance, Alpaca, Twelve Data)")
 
 
 def _download_index_alpaca(symbol: str) -> Optional[pd.DataFrame]:
@@ -383,7 +393,12 @@ def _download_index_alpaca(symbol: str) -> Optional[pd.DataFrame]:
         )
         bars_response = data_client.get_stock_bars(request)
 
-        if symbol not in bars_response or not bars_response[symbol]:
+        # BarSet doesn't support `in` operator — access directly via try/except
+        try:
+            bars_list = bars_response[symbol]
+        except (KeyError, Exception):
+            bars_list = None
+        if not bars_list:
             logger.warning("Alpaca returned no bars for %s", symbol)
             return None
 
@@ -396,7 +411,7 @@ def _download_index_alpaca(symbol: str) -> Optional[pd.DataFrame]:
                 "Close": float(bar.close),
                 "Volume": float(bar.volume),
             }
-            for bar in bars_response[symbol]
+            for bar in bars_list
         ]
         df = pd.DataFrame(rows).set_index("Date")
         df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)

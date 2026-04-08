@@ -355,10 +355,15 @@ def _fetch_intraday_volume(ticker: str) -> Optional[float]:
             end=check_time.astimezone(timezone.utc),
         )
         bars = data_client.get_stock_bars(request)
-        if ticker not in bars or not bars[ticker]:
+        # BarSet doesn't support `in` operator — access directly
+        try:
+            bars_list = bars[ticker]
+        except (KeyError, Exception):
+            bars_list = None
+        if not bars_list:
             return None
 
-        total_vol = sum(float(bar.volume) for bar in bars[ticker])
+        total_vol = sum(float(bar.volume) for bar in bars_list)
         return total_vol
 
     except Exception as e:
