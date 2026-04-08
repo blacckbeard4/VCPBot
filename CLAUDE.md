@@ -11,6 +11,22 @@
 - **Path**: /home/ubuntu/trading-bot
 - **Process**: systemd service `trading-bot`
 - **Paper trading** by default (`ALPACA_PAPER=true`)
+- **SSH key**: `~/.ssh/oracle_trading_bot`
+- **Git**: VM is a git repo tracking `origin/main` (https://github.com/blacckbeard4/VCPBot.git)
+
+### Deploy workflow (after any code change)
+```bash
+# 1. Commit & push locally
+git add <file> && git commit -m "..." && git push origin main
+
+# 2. Pull on VM and restart
+ssh -i ~/.ssh/oracle_trading_bot ubuntu@150.136.140.21 \
+  "cd /home/ubuntu/trading-bot && git pull origin main && sudo systemctl restart trading-bot"
+
+# 3. Tail logs to confirm
+ssh -i ~/.ssh/oracle_trading_bot ubuntu@150.136.140.21 \
+  "sudo journalctl -u trading-bot -f"
+```
 
 ## Strategy: VCP Momentum Breakout (Minervini-style)
 - **Long-only**, US equities, daily timeframe
