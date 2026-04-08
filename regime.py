@@ -378,7 +378,8 @@ def _download_index_alpaca(symbol: str) -> Optional[pd.DataFrame]:
             timeframe=TimeFrame.Day,
             start=start_dt,
             end=end_dt,
-            feed="iex",  # free data feed; falls back gracefully on paper accounts
+            feed="iex",        # free data feed; works with paper accounts
+            adjustment="all",  # match yfinance auto_adjust=True (split + dividend adjusted)
         )
         bars_response = data_client.get_stock_bars(request)
 
