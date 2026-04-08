@@ -23,7 +23,7 @@ Persists regime state across restarts via SQLite regime_state table.
 
 import logging
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -34,6 +34,7 @@ import pandas_market_calendars as mcal
 from config import (
     YFINANCE_RETRIES, YFINANCE_RETRY_SLEEP, TIMEZONE,
     FTD_MIN_DAY, FTD_MAX_DAY, FTD_MIN_GAIN_PCT, FTD_DISTRIBUTION_WINDOW,
+    ALPACA_API_KEY, ALPACA_SECRET_KEY,
 )
 import db
 
@@ -321,7 +322,12 @@ def _update_ftd_state(
 
 
 def _download_index(symbol: str) -> pd.DataFrame:
-    """Download 2y daily OHLCV for a given index symbol with retry logic."""
+    """Download 2y daily OHLCV for a given index symbol.
+
+    Tries yfinance first (with retries), then falls back to Alpaca's
+    historical bars API if yfinance is unavailable.
+    """
+    # ── Primary: yfinance ──
     for attempt in range(1, YFINANCE_RETRIES + 1):
         try:
             df = yf.download(
@@ -333,13 +339,69 @@ def _download_index(symbol: str) -> pd.DataFrame:
                     df.columns = df.columns.get_level_values(0)
                 return df
             logger.warning(
-                "%s download returned %d rows (need 200), retry %d/%d",
+                "%s yfinance returned %d rows (need 200), retry %d/%d",
                 symbol, len(df) if df is not None else 0, attempt, YFINANCE_RETRIES,
             )
         except Exception as e:
-            logger.warning("%s download failed (attempt %d/%d): %s",
+            logger.warning("%s yfinance failed (attempt %d/%d): %s",
                            symbol, attempt, YFINANCE_RETRIES, e)
         if attempt < YFINANCE_RETRIES:
             time.sleep(YFINANCE_RETRY_SLEEP)
 
-    raise RuntimeError(f"Failed to download {symbol} data after all retries")
+    # ── Fallback: Alpaca historical daily bars ──
+    logger.warning("%s: yfinance exhausted all retries — trying Alpaca data API", symbol)
+    df = _download_index_alpaca(symbol)
+    if df is not None and len(df) >= 200:
+        return df
+
+    raise RuntimeError(f"Failed to download {symbol} data after all retries (yfinance + Alpaca)")
+
+
+def _download_index_alpaca(symbol: str) -> Optional[pd.DataFrame]:
+    """Fetch 2y of daily OHLCV bars from Alpaca as a fallback.
+
+    Returns a DataFrame with columns [Open, High, Low, Close, Volume] indexed
+    by date (same shape as the yfinance output), or None on failure.
+    """
+    try:
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+
+        data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+        end_dt = datetime.now(timezone.utc)
+        start_dt = end_dt - timedelta(days=730)  # ~2 years
+
+        request = StockBarsRequest(
+            symbol_or_symbols=[symbol],
+            timeframe=TimeFrame.Day,
+            start=start_dt,
+            end=end_dt,
+            feed="iex",  # free data feed; falls back gracefully on paper accounts
+        )
+        bars_response = data_client.get_stock_bars(request)
+
+        if symbol not in bars_response or not bars_response[symbol]:
+            logger.warning("Alpaca returned no bars for %s", symbol)
+            return None
+
+        rows = [
+            {
+                "Date": bar.timestamp,
+                "Open": float(bar.open),
+                "High": float(bar.high),
+                "Low": float(bar.low),
+                "Close": float(bar.close),
+                "Volume": float(bar.volume),
+            }
+            for bar in bars_response[symbol]
+        ]
+        df = pd.DataFrame(rows).set_index("Date")
+        df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
+        logger.info("Alpaca fallback: fetched %d bars for %s", len(df), symbol)
+        return df
+
+    except Exception as e:
+        logger.warning("Alpaca fallback failed for %s: %s", symbol, e)
+        return None
