@@ -117,6 +117,18 @@ CREATE TABLE IF NOT EXISTS errors (
     timestamp           TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_errors_step ON errors(step);
+
+-- ticker_rejections: per-ticker rejection traces for Phase 3, VCP, and Risk phases
+CREATE TABLE IF NOT EXISTS ticker_rejections (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_date    TEXT NOT NULL,
+    ticker      TEXT NOT NULL,
+    phase       TEXT NOT NULL,   -- 'PHASE3', 'VCP', 'RISK'
+    reason      TEXT NOT NULL,
+    timestamp   TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_rejections_run_date ON ticker_rejections(run_date);
+CREATE INDEX IF NOT EXISTS idx_rejections_ticker ON ticker_rejections(ticker);
 """
 
 
@@ -131,6 +143,19 @@ def init_db() -> None:
             logger.info("Migrated regime_state: added ftd_date column")
         except Exception:
             pass  # column already exists
+        # Migration: create ticker_rejections if it doesn't exist (existing DBs)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS ticker_rejections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_date TEXT NOT NULL, ticker TEXT NOT NULL,
+                    phase TEXT NOT NULL, reason TEXT NOT NULL,
+                    timestamp TEXT DEFAULT (datetime('now'))
+                )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_rejections_run_date ON ticker_rejections(run_date)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_rejections_ticker ON ticker_rejections(ticker)")
+        except Exception:
+            pass
     conn.close()
     logger.info("Database initialized at %s", DB_PATH)
 
@@ -361,6 +386,37 @@ def upsert_regime_state(
              rally_day1_low, rally_day1_date, rally_day_count, ftd_date),
         )
     conn.close()
+
+
+# ─── ticker_rejections CRUD ─────────────────────────────────
+
+
+def bulk_insert_rejections(run_date: str, rejections: list[dict]) -> None:
+    """Insert multiple rejection trace rows in one transaction.
+
+    Each dict must have: ticker (str), phase (str), reason (str).
+    """
+    if not rejections:
+        return
+    conn = get_conn()
+    with conn:
+        conn.executemany(
+            "INSERT INTO ticker_rejections (run_date, ticker, phase, reason) VALUES (?, ?, ?, ?)",
+            [(run_date, r["ticker"], r["phase"], r["reason"]) for r in rejections],
+        )
+    conn.close()
+    logger.debug("Logged %d rejection traces for %s", len(rejections), run_date)
+
+
+def get_rejections_for_date(run_date: str) -> list[sqlite3.Row]:
+    """Return all rejection traces for a given run date."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM ticker_rejections WHERE run_date = ? ORDER BY phase, ticker",
+        (run_date,),
+    ).fetchall()
+    conn.close()
+    return rows
 
 
 # ─── error logging ──────────────────────────────────────────

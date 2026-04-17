@@ -237,17 +237,17 @@ def _passes_phase2(df: pd.DataFrame) -> bool:
 # ─── Phase 3: Trend template ────────────────────────────────
 
 
-def _apply_trend_template(df: pd.DataFrame) -> Optional[dict]:
+def _apply_trend_template(df: pd.DataFrame) -> tuple[Optional[dict], str]:
     """Apply all 7 trend template checks.
 
-    Returns indicator dict if all pass, None if any fail.
+    Returns (indicator_dict, "") on pass, (None, reason) on fail.
     """
     close = df["Close"]
     high = df["High"]
     low = df["Low"]
 
     if len(close) < 252:
-        return None
+        return None, "insufficient history (<252 bars)"
 
     sma50 = compute_sma(close, 50)
     sma150 = compute_sma(close, 150)
@@ -260,37 +260,37 @@ def _apply_trend_template(df: pd.DataFrame) -> Optional[dict]:
     s200_30d_ago = float(sma200.iloc[-31]) if len(sma200) > 31 and not pd.isna(sma200.iloc[-31]) else None
 
     if any(pd.isna(x) for x in [s50, s150, s200]):
-        return None
+        return None, "SMA NaN"
 
     # Check 1: Close > 150 SMA AND Close > 200 SMA
     if not (c > s150 and c > s200):
-        return None
+        return None, f"close {c:.2f} not above SMA150 {s150:.2f} / SMA200 {s200:.2f}"
 
     # Check 2: 150 SMA > 200 SMA
     if s150 <= s200:
-        return None
+        return None, f"SMA150 {s150:.2f} not above SMA200 {s200:.2f}"
 
     # Check 3: 200 SMA slope positive over last 30 days
     if s200_30d_ago is None or s200 <= s200_30d_ago:
-        return None
+        return None, f"SMA200 slope flat/down ({s200:.2f} vs {s200_30d_ago:.2f} 30d ago)"
 
     # Check 4: 50 SMA > 150 SMA AND 50 SMA > 200 SMA
     if not (s50 > s150 and s50 > s200):
-        return None
+        return None, f"SMA50 {s50:.2f} not above SMA150 {s150:.2f} / SMA200 {s200:.2f}"
 
     # Check 5: Close > 50 SMA
     if c <= s50:
-        return None
+        return None, f"close {c:.2f} not above SMA50 {s50:.2f}"
 
     # Check 6: Close >= 52-week low * 1.30
     w52_low = float(low.iloc[-252:].min())
     if c < w52_low * (1 + MIN_PCT_ABOVE_52W_LOW):
-        return None
+        return None, f"close {c:.2f} < 52w-low {w52_low:.2f} x {1+MIN_PCT_ABOVE_52W_LOW:.2f} ({w52_low*(1+MIN_PCT_ABOVE_52W_LOW):.2f})"
 
     # Check 7: Close >= 52-week high * 0.75
     w52_high = float(high.iloc[-252:].max())
     if c < w52_high * (1 - MAX_PCT_BELOW_52W_HIGH):
-        return None
+        return None, f"close {c:.2f} > 25% below 52w-high {w52_high:.2f}"
 
     return {
         "close": round(c, 2),
@@ -300,23 +300,25 @@ def _apply_trend_template(df: pd.DataFrame) -> Optional[dict]:
         "w52_low": round(w52_low, 2),
         "w52_high": round(w52_high, 2),
         "adv50": float(df["Volume"].iloc[-50:].mean()),
-    }
+    }, ""
 
 
 # ─── Main scanner ────────────────────────────────────────────
 
 
-def scan_universe(tickers: list[str]) -> list[dict]:
+def scan_universe(tickers: list[str]) -> tuple[list[dict], list[dict]]:
     """Scan all tickers in batches. Apply Phase 2 + Phase 3 filters, then RS rank.
 
-    Returns list of dicts for tickers passing all filters, sorted by RS_Rank desc.
-
-    Each dict contains:
-      ticker, close, sma50/150/200, w52_high/low, rs_raw, rs_rank, adv50, df (OHLCV)
+    Returns (results, rejections):
+      results: list of dicts for tickers passing all filters, sorted by RS_Rank desc.
+        Each dict: ticker, close, sma50/150/200, w52_high/low, rs_raw, rs_rank, adv50, df
+      rejections: list of {ticker, phase, reason} dicts for Phase 3 / RS rejects.
+        (Phase 2 rejections are not collected — too many tickers to track individually.)
     """
     logger.info("Scanner starting — %d tickers in universe", len(tickers))
 
-    phase2_results: list[dict] = []  # {ticker, df, indicators}
+    phase2_results: list[dict] = []  # {ticker, df, indicators, rs_raw}
+    rejections: list[dict] = []
     batches = [
         tickers[i:i + SCANNER_BATCH_SIZE]
         for i in range(0, len(tickers), SCANNER_BATCH_SIZE)
@@ -333,18 +335,20 @@ def scan_universe(tickers: list[str]) -> list[dict]:
 
         for ticker, df in batch_data.items():
             try:
-                # Phase 2 gate
+                # Phase 2 gate (no per-ticker rejection tracking — universe too large)
                 if not _passes_phase2(df):
                     continue
 
-                # Phase 3 trend template
-                indicators = _apply_trend_template(df)
+                # Phase 3 trend template — track rejection reason
+                indicators, reason = _apply_trend_template(df)
                 if indicators is None:
+                    rejections.append({"ticker": ticker, "phase": "PHASE3", "reason": reason})
                     continue
 
                 # Compute RS_Raw (for ranking later)
                 rs_raw = compute_rs_raw(df["Close"])
                 if rs_raw is None:
+                    rejections.append({"ticker": ticker, "phase": "PHASE3", "reason": "insufficient history for RS calc"})
                     continue
 
                 phase2_results.append({
@@ -367,7 +371,7 @@ def scan_universe(tickers: list[str]) -> list[dict]:
                 len(phase2_results), len(tickers))
 
     if not phase2_results:
-        return []
+        return [], rejections
 
     # ── RS Rank: percentile rank across all passing stocks ──
     rs_raws = [r["rs_raw"] for r in phase2_results]
@@ -383,6 +387,11 @@ def scan_universe(tickers: list[str]) -> list[dict]:
     for r in phase2_results:
         rs_rank = percentile_rank(r["rs_raw"])
         if rs_rank < RS_MIN_RANK:
+            rejections.append({
+                "ticker": r["ticker"],
+                "phase": "PHASE3",
+                "reason": f"RS_Rank {rs_rank:.1f} < {RS_MIN_RANK} threshold",
+            })
             continue
         ind = r["indicators"]
         final.append({
@@ -407,4 +416,4 @@ def scan_universe(tickers: list[str]) -> list[dict]:
     open_positions = _db.get_open_trades()
     final = _apply_sector_filter(final, open_positions)
 
-    return final
+    return final, rejections

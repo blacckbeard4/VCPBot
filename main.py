@@ -136,6 +136,8 @@ def run_scan_pipeline() -> None:
         return
 
     # ── Phase 2+3: Universe screen + Trend Template + RS Rank ──
+    all_rejections: list[dict] = []
+
     try:
         universe = get_full_universe()
         if not universe:
@@ -143,7 +145,8 @@ def run_scan_pipeline() -> None:
             return
         logger.info("Universe: %d tickers", len(universe))
 
-        scan_results = scanner.scan_universe(universe)
+        scan_results, phase3_rejections = scanner.scan_universe(universe)
+        all_rejections.extend(phase3_rejections)
         logger.info("Phase 2+3: %d tickers passed", len(scan_results))
     except Exception as e:
         msg = f"Scanner failed: {e}"
@@ -155,6 +158,7 @@ def run_scan_pipeline() -> None:
     gc.collect()
 
     if not scan_results:
+        db.bulk_insert_rejections(today, all_rejections)
         db.insert_scan_log(
             run_date=today, regime=regime["regime_label"],
             tickers_scanned=len(universe), tickers_phase2=0,
@@ -166,7 +170,8 @@ def run_scan_pipeline() -> None:
 
     # ── Phase 4: VCP pattern detection ──
     try:
-        vcp_setups = vcp_detector.detect_vcp_batch(scan_results)
+        vcp_setups, vcp_rejections = vcp_detector.detect_vcp_batch(scan_results)
+        all_rejections.extend(vcp_rejections)
         logger.info("Phase 4 (VCP): %d setups found", len(vcp_setups))
     except Exception as e:
         logger.error("VCP detection failed: %s", e)
@@ -176,6 +181,7 @@ def run_scan_pipeline() -> None:
     gc.collect()
 
     if not vcp_setups:
+        db.bulk_insert_rejections(today, all_rejections)
         db.insert_scan_log(
             run_date=today, regime=regime["regime_label"],
             tickers_scanned=len(universe), tickers_phase2=phase3_count,
@@ -200,6 +206,15 @@ def run_scan_pipeline() -> None:
         logger.error("Risk manager failed: %s", e)
         db.log_error("risk_manager", str(type(e).__name__), str(e), traceback_str=traceback.format_exc())
         decisions = []
+
+    # Collect risk rejections
+    for decision in decisions:
+        if decision["decision"] != "APPROVE":
+            all_rejections.append({
+                "ticker": decision["ticker"],
+                "phase": "RISK",
+                "reason": decision.get("reason", "risk check failed"),
+            })
 
     # ── Write approved trades as PENDING to DB ──
     orders_queued = 0
@@ -252,6 +267,7 @@ def run_scan_pipeline() -> None:
 
         orders_queued += 1
 
+    db.bulk_insert_rejections(today, all_rejections)
     db.insert_scan_log(
         run_date=today,
         regime=regime["regime_label"],
