@@ -149,15 +149,68 @@ def compute_rs_raw(close: pd.Series) -> Optional[float]:
 # ─── Batch downloader ────────────────────────────────────────
 
 
+def _download_single_ticker(ticker: str, period: str = "2y") -> Optional[pd.DataFrame]:
+    """Download OHLCV for one ticker using Ticker.history() with exponential backoff.
+
+    Falls back to this when batch download is rate-limited.
+    Returns DataFrame or None if all attempts fail.
+    """
+    for attempt in range(1, YFINANCE_RETRIES + 1):
+        try:
+            df = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True)
+            if df is not None and len(df) >= 200:
+                df.index = pd.to_datetime(df.index).tz_localize(None)
+                return df
+        except Exception as e:
+            wait = YFINANCE_RETRY_SLEEP * attempt  # exponential: 60s, 120s, 180s
+            logger.warning("Single download %s failed (attempt %d/%d): %s — sleeping %ds",
+                           ticker, attempt, YFINANCE_RETRIES, e, wait)
+            if attempt < YFINANCE_RETRIES:
+                time.sleep(wait)
+    return None
+
+
 def download_batch(
     tickers: list[str],
     period: str = "2y",
     interval: str = "1d",
 ) -> dict[str, pd.DataFrame]:
-    """Download OHLCV for a batch of tickers with retry logic.
+    """Download OHLCV for a batch of tickers.
+
+    Strategy:
+      1. Try yf.download() for the whole batch (fast path).
+      2. If batch is rate-limited or returns empty, fall back to per-ticker
+         Ticker.history() downloads with exponential backoff (slow but reliable).
 
     Returns dict mapping ticker → DataFrame. Tickers with < 200 bars are omitted.
     """
+    def _parse_batch_result(data, tickers) -> dict[str, pd.DataFrame]:
+        result: dict[str, pd.DataFrame] = {}
+        if len(tickers) == 1:
+            t = tickers[0]
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = data.columns.get_level_values(0)
+            if len(data) >= 200:
+                result[t] = data
+        else:
+            for t in tickers:
+                try:
+                    if isinstance(data.columns, pd.MultiIndex):
+                        if t not in data.columns.get_level_values(0):
+                            continue
+                        df = data[t].dropna(how="all")
+                    else:
+                        df = data
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(1)
+                    if len(df) >= 200:
+                        result[t] = df
+                except (KeyError, TypeError):
+                    continue
+        return result
+
+    # ── Fast path: batch download ──
+    is_rate_limited = False
     for attempt in range(1, YFINANCE_RETRIES + 1):
         try:
             data = yf.download(
@@ -165,44 +218,40 @@ def download_batch(
                 group_by="ticker", threads=False, progress=False, auto_adjust=True,
             )
             if data is None or data.empty:
-                logger.warning("Batch download empty (attempt %d/%d)",
-                               attempt, YFINANCE_RETRIES)
+                logger.warning("Batch download empty (attempt %d/%d)", attempt, YFINANCE_RETRIES)
                 if attempt < YFINANCE_RETRIES:
                     time.sleep(YFINANCE_RETRY_SLEEP)
                 continue
-
-            result: dict[str, pd.DataFrame] = {}
-            if len(tickers) == 1:
-                t = tickers[0]
-                if isinstance(data.columns, pd.MultiIndex):
-                    data.columns = data.columns.get_level_values(0)
-                if len(data) >= 200:
-                    result[t] = data
-            else:
-                for t in tickers:
-                    try:
-                        if isinstance(data.columns, pd.MultiIndex):
-                            if t not in data.columns.get_level_values(0):
-                                continue
-                            df = data[t].dropna(how="all")
-                        else:
-                            df = data
-                        if isinstance(df.columns, pd.MultiIndex):
-                            df.columns = df.columns.get_level_values(1)
-                        if len(df) >= 200:
-                            result[t] = df
-                    except (KeyError, TypeError):
-                        continue
-            return result
+            return _parse_batch_result(data, tickers)
 
         except Exception as e:
-            logger.warning("Batch download failed (attempt %d/%d): %s",
-                           attempt, YFINANCE_RETRIES, e)
-            if attempt < YFINANCE_RETRIES:
-                time.sleep(YFINANCE_RETRY_SLEEP)
+            err_str = str(e).lower()
+            if "rate" in err_str or "too many" in err_str or "429" in err_str:
+                is_rate_limited = True
+                logger.warning("Batch rate-limited (attempt %d/%d) — will fall back to per-ticker",
+                               attempt, YFINANCE_RETRIES)
+                if attempt < YFINANCE_RETRIES:
+                    time.sleep(YFINANCE_RETRY_SLEEP)
+            else:
+                logger.warning("Batch download failed (attempt %d/%d): %s", attempt, YFINANCE_RETRIES, e)
+                if attempt < YFINANCE_RETRIES:
+                    time.sleep(YFINANCE_RETRY_SLEEP)
 
-    logger.error("Batch download failed after all retries (%d tickers)", len(tickers))
-    return {}
+    # ── Slow path: per-ticker fallback ──
+    reason = "rate-limited" if is_rate_limited else "empty response"
+    logger.warning("Batch failed (%s) — falling back to per-ticker downloads (%d tickers)",
+                   reason, len(tickers))
+    result: dict[str, pd.DataFrame] = {}
+    for ticker in tickers:
+        df = _download_single_ticker(ticker, period=period)
+        if df is not None:
+            result[ticker] = df
+        time.sleep(2)  # gentle inter-ticker pause to avoid re-triggering rate limit
+    if result:
+        logger.info("Per-ticker fallback recovered %d/%d tickers", len(result), len(tickers))
+    else:
+        logger.error("Per-ticker fallback also failed for all %d tickers", len(tickers))
+    return result
 
 
 # ─── Phase 2: Hard gate filters ─────────────────────────────
