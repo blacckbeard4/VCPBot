@@ -53,17 +53,31 @@ MIN_AVG_VOLUME: int = 1_000_000     # 50-day avg daily volume minimum
 MIN_PRICE: float = 10.0             # minimum close price
 
 # ── Trend template (Phase 3) ──
-RS_MIN_RANK: int = 80               # minimum RS percentile rank (top 20%)
-MIN_PCT_ABOVE_52W_LOW: float = 0.30 # close >= 52w_low * 1.30
-MAX_PCT_BELOW_52W_HIGH: float = 0.25  # close >= 52w_high * 0.75
+RS_RANK_PEAK_MIN: int   = 80   # peak RS in trailing 60 days must be >= this
+RS_RANK_CURRENT_MIN: int = 70  # current RS at scan time must be >= this
+RS_RANK_PREFERRED: int  = 85   # log-only elite tier, no hard filter
+MIN_PCT_ABOVE_52W_LOW: float  = 0.30   # close >= 52w_low * 1.30
+MAX_PCT_BELOW_52W_HIGH: float = 0.25   # close >= 52w_high * 0.75
 
-# ── VCP pattern (Phase 4) ──
-EARNINGS_BLACKOUT_DAYS: int = 14    # reject if earnings within 14 days
-MIN_BASE_WEEKS: int = 4             # minimum base duration
-MAX_FINAL_CONTRACTION_PCT: float = 0.08   # final contraction must be < 8%
-MIN_CONTRACTIONS: int = 2           # need at least 2 contractions
-MAX_CONTRACTIONS: int = 4           # look at most 4 contractions
-SWING_PIVOT_BARS: int = 3           # bars each side for swing high/low detection
+# ── VCP pattern (Phase 4) — 3-tier hierarchical pivot detection ──
+EARNINGS_BLACKOUT_DAYS: int  = 14    # reject if earnings within 14 days
+MIN_BASE_DAYS: int           = 20    # minimum base duration in trading days (≈4 weeks)
+MAX_FINAL_CONTRACTION_PCT: float = 0.08   # final contraction depth < 8%
+MIN_CONTRACTIONS: int        = 2     # minimum contraction count in base
+MAX_CONTRACTIONS: int        = 6     # maximum contraction count to inspect
+LSH_MIN_PULLBACK_PCT: float  = 0.15  # LSH must precede >=15% pullback to qualify
+PRIOR_UPTREND_MIN_PCT: float = 0.30  # price must have advanced >=30% into the LSH
+
+# Swing pivot parameters — three distinct scales
+SWING_MACRO_N: int       = 15   # pass 1: base boundary / Left Side High detection
+SWING_CONTRACTION_N: int = 8    # pass 2: intermediate contraction peaks/troughs
+SWING_MICRO_N: int       = 3    # pass 3: final tight pivot for exact entry point
+
+# ── High Tight Flag (Phase 4b) ──
+HTF_GAIN_8W_MIN_PCT: float     = 100.0  # must gain >=100% in prior 8 weeks (40 bars)
+HTF_CONSOLIDATION_MAX_PCT: float = 20.0  # single pullback < 20% from recent high
+HTF_DAYS_MIN: int              = 5      # consolidation duration: min bars
+HTF_DAYS_MAX: int              = 15     # consolidation duration: max bars
 
 # ── Follow-Through Day (Phase 1) ──
 FTD_MIN_DAY: int = 4               # FTD valid starting day 4 of rally attempt

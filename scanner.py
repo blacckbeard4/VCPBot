@@ -31,7 +31,8 @@ import yfinance as yf
 
 from config import (
     SCANNER_BATCH_SIZE, YFINANCE_RETRIES, YFINANCE_RETRY_SLEEP,
-    MIN_AVG_VOLUME, MIN_PRICE, RS_MIN_RANK,
+    MIN_AVG_VOLUME, MIN_PRICE,
+    RS_RANK_PEAK_MIN, RS_RANK_CURRENT_MIN, RS_RANK_PREFERRED,
     MIN_PCT_ABOVE_52W_LOW, MAX_PCT_BELOW_52W_HIGH, MAX_SECTOR_POSITIONS,
     FINNHUB_API_KEY,
 )
@@ -132,18 +133,41 @@ def compute_roc(close: pd.Series, n: int) -> float:
 
 
 def compute_rs_raw(close: pd.Series) -> Optional[float]:
-    """Compute Minervini RS_Raw composite score.
+    """Compute Minervini RS_Raw composite score (current bar only).
 
     RS_Raw = 0.4*ROC_63 + 0.2*ROC_126 + 0.2*ROC_189 + 0.2*ROC_252
     Returns None if insufficient history.
     """
     if len(close) < 253:
         return None
-    roc63 = compute_roc(close, 63)
+    roc63  = compute_roc(close, 63)
     roc126 = compute_roc(close, 126)
     roc189 = compute_roc(close, 189)
     roc252 = compute_roc(close, 252)
     return 0.4 * roc63 + 0.2 * roc126 + 0.2 * roc189 + 0.2 * roc252
+
+
+def compute_rs_raw_series(close: pd.Series, window: int = 60) -> Optional[pd.Series]:
+    """Compute rolling RS_Raw over the last `window` bars for peak RS tracking.
+
+    Returns a pd.Series of RS_Raw values (one per bar in the trailing window),
+    or None if insufficient history.
+    """
+    if len(close) < 253 + window:
+        return None
+    values = []
+    for lag in range(window - 1, -1, -1):
+        # Slice ending `lag` bars before the current bar
+        sl = close.iloc[:len(close) - lag] if lag > 0 else close
+        if len(sl) < 253:
+            values.append(None)
+            continue
+        def roc(n: int) -> float:
+            if len(sl) < n + 1:
+                return 0.0
+            return (float(sl.iloc[-1]) - float(sl.iloc[-n - 1])) / float(sl.iloc[-n - 1]) * 100
+        values.append(0.4 * roc(63) + 0.2 * roc(126) + 0.2 * roc(189) + 0.2 * roc(252))
+    return pd.Series(values)
 
 
 # ─── Batch downloader ────────────────────────────────────────
@@ -394,17 +418,19 @@ def scan_universe(tickers: list[str]) -> tuple[list[dict], list[dict]]:
                     rejections.append({"ticker": ticker, "phase": "PHASE3", "reason": reason})
                     continue
 
-                # Compute RS_Raw (for ranking later)
+                # Compute RS_Raw (current) + trailing series for peak RS
                 rs_raw = compute_rs_raw(df["Close"])
                 if rs_raw is None:
                     rejections.append({"ticker": ticker, "phase": "PHASE3", "reason": "insufficient history for RS calc"})
                     continue
 
+                rs_series = compute_rs_raw_series(df["Close"], window=60)
                 phase2_results.append({
                     "ticker": ticker,
                     "df": df,
                     "indicators": indicators,
                     "rs_raw": rs_raw,
+                    "rs_series": rs_series,
                 })
 
             except Exception as e:
@@ -428,37 +454,68 @@ def scan_universe(tickers: list[str]) -> tuple[list[dict], list[dict]]:
     n = len(sorted_scores)
 
     def percentile_rank(score: float) -> float:
-        # Use bisect for correct tie-handling: ties get the rank of their first occurrence
         rank = bisect.bisect_left(sorted_scores, score)
         return round((rank / (n - 1)) * 98 + 1, 1) if n > 1 else 50.0
 
     final: list[dict] = []
     for r in phase2_results:
-        rs_rank = percentile_rank(r["rs_raw"])
-        if rs_rank < RS_MIN_RANK:
+        current_rs = percentile_rank(r["rs_raw"])
+
+        # Gate 1: peak RS in trailing 60 days must be >= RS_RANK_PEAK_MIN
+        peak_rs = current_rs  # fallback if series unavailable
+        if r["rs_series"] is not None:
+            raw_vals = [v for v in r["rs_series"] if v is not None]
+            if raw_vals:
+                peak_raw = max(raw_vals)
+                peak_rs  = percentile_rank(peak_raw)
+
+        if peak_rs < RS_RANK_PEAK_MIN:
             rejections.append({
                 "ticker": r["ticker"],
                 "phase": "PHASE3",
-                "reason": f"RS_Rank {rs_rank:.1f} < {RS_MIN_RANK} threshold",
+                "reason": (
+                    f"RS_PEAK_REJECT: peak RS {peak_rs:.0f} < {RS_RANK_PEAK_MIN} "
+                    f"in trailing 60d (current RS {current_rs:.0f})"
+                ),
             })
             continue
+
+        # Gate 2: current RS must be >= RS_RANK_CURRENT_MIN
+        if current_rs < RS_RANK_CURRENT_MIN:
+            rejections.append({
+                "ticker": r["ticker"],
+                "phase": "PHASE3",
+                "reason": (
+                    f"RS_CURRENT_REJECT: current RS {current_rs:.0f} < {RS_RANK_CURRENT_MIN} "
+                    f"(peak RS {peak_rs:.0f})"
+                ),
+            })
+            continue
+
+        if current_rs >= RS_RANK_PREFERRED:
+            logger.info("RS_ELITE: %s RS %.0f — preferred tier", r["ticker"], current_rs)
+
         ind = r["indicators"]
         final.append({
-            "ticker": r["ticker"],
-            "df": r["df"],
-            "close": ind["close"],
-            "sma50": ind["sma50"],
-            "sma150": ind["sma150"],
-            "sma200": ind["sma200"],
-            "w52_low": ind["w52_low"],
+            "ticker":   r["ticker"],
+            "df":       r["df"],
+            "close":    ind["close"],
+            "sma50":    ind["sma50"],
+            "sma150":   ind["sma150"],
+            "sma200":   ind["sma200"],
+            "w52_low":  ind["w52_low"],
             "w52_high": ind["w52_high"],
-            "adv50": ind["adv50"],
-            "rs_raw": round(r["rs_raw"], 2),
-            "rs_rank": rs_rank,
+            "adv50":    ind["adv50"],
+            "rs_raw":   round(r["rs_raw"], 2),
+            "rs_rank":  current_rs,
+            "rs_peak":  round(peak_rs, 1),
         })
 
     final.sort(key=lambda x: x["rs_rank"], reverse=True)
-    logger.info("RS filter: %d tickers with RS_Rank >= %d", len(final), RS_MIN_RANK)
+    logger.info(
+        "RS dual-gate: %d tickers pass (peak>=%d, current>=%d)",
+        len(final), RS_RANK_PEAK_MIN, RS_RANK_CURRENT_MIN,
+    )
 
     # ── Sector concentration filter ──
     import db as _db  # local import to avoid circular dependency

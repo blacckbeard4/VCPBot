@@ -64,6 +64,51 @@ DEFAULT_TICKERS = [
     "FDX", "NOC", "GD", "LMT", "MMC", "USB", "F", "GM", "COF",
 ]
 
+# ── Growth/momentum universe — the natural home of VCP setups ───────────────
+# Includes semis, cloud/SaaS, biotech, consumer growth, fintech, and known
+# momentum names from 2015-2024. Newer IPOs (SNOW, CRWD, etc.) contribute
+# only from their listing date onward — no data, no trades, no bias.
+GROWTH_TICKERS = [
+    # Semiconductors & equipment
+    "NVDA", "AMD", "AVGO", "MRVL", "AMAT", "LRCX", "KLAC", "SNPS", "CDNS",
+    "MPWR", "ENTG", "ON", "SMCI", "ONTO", "WOLF", "AMBA", "SLAB",
+
+    # Software / Cloud / SaaS
+    "CRM", "NOW", "WDAY", "ADBE", "INTU", "VEEV", "HUBS", "TWLO", "DDOG",
+    "NET", "ZS", "CRWD", "PANW", "FTNT", "OKTA", "MDB", "SNOW", "PAYC",
+    "DOCU", "ZM", "BILL", "PCTY", "APPN", "SMAR", "RNG",
+
+    # Internet / E-commerce
+    "NFLX", "AMZN", "GOOGL", "META", "SHOP", "MELI", "SE", "ETSY",
+    "BKNG", "ABNB", "UBER", "DASH", "PINS", "SNAP",
+
+    # Fintech / Payments
+    "SQ", "PYPL", "COIN", "MA", "V", "AFRM", "SOFI",
+
+    # Biotech / MedTech
+    "ISRG", "DXCM", "PODD", "INSP", "ALGN", "IRTC", "EXAS",
+    "BNTX", "MRNA", "ILMN", "IDXX", "HOLX", "TMDX",
+
+    # Consumer growth & brands
+    "LULU", "FIVE", "MNST", "CELH", "CMG", "ULTA", "RH", "DECK",
+    "ONON", "SKX", "WING", "ELF", "BROS", "BURL",
+
+    # Energy transition
+    "ENPH", "FSLR", "SEDG", "RUN",
+
+    # Industrials / construction growth
+    "BLDR", "IBP", "TREX", "BECN", "AXON", "FERG",
+
+    # Financial data / exchanges
+    "MKTX", "MSCI", "FDS", "CBOE", "ICE", "SPGI",
+
+    # Misc high-momentum names
+    "TSLA", "AAPL", "MSFT",  # mega-caps that have had VCP years
+    "TTD", "ROKU", "U", "RBLX", "DUOL", "GTLB",
+    "CPNG", "JD", "PDD",     # international growth
+    "AEHR", "AAON", "EXPO",  # hidden gems with strong VCP history
+]
+
 
 # ═══════════════════════════════════════════════════════════
 # DATA DOWNLOAD
@@ -368,7 +413,7 @@ def run_backtest(
             print(f"  Scanning {yr}... (equity ${equity:,.0f})", flush=True)
 
         # ── Get bar index in SPY for this scan date ──
-        spy_loc = spy_df.index.get_loc(scan_dt)
+        spy_loc = max(0, spy_df.index.searchsorted(scan_dt, side="right") - 1)
 
         # ── Step 1: Check open positions for exits that happened this week ──
         still_open = []
@@ -381,7 +426,7 @@ def run_backtest(
             # Find bar indices from last check to today
             last_check_idx = pos.get("last_check_idx", pos["entry_idx"])
             try:
-                today_idx = tk_df.index.get_loc(scan_dt, method="ffill")
+                today_idx = max(0, tk_df.index.searchsorted(scan_dt, side="right") - 1)
             except Exception:
                 still_open.append(pos)
                 continue
@@ -448,7 +493,7 @@ def run_backtest(
                 continue
             tk_df = data[ticker]
             try:
-                tk_loc = tk_df.index.get_loc(scan_dt, method="ffill")
+                tk_loc = max(0, tk_df.index.searchsorted(scan_dt, side="right") - 1)
             except Exception:
                 continue
             tk_slice = tk_df.iloc[:tk_loc + 1]
@@ -491,7 +536,7 @@ def run_backtest(
 
             tk_df = data[ticker]
             try:
-                tk_loc = tk_df.index.get_loc(scan_dt, method="ffill")
+                tk_loc = max(0, tk_df.index.searchsorted(scan_dt, side="right") - 1)
             except Exception:
                 continue
             tk_slice = tk_df.iloc[:tk_loc + 1]
@@ -646,7 +691,7 @@ def print_report(
     print("\n" + "═" * 100)
     print(" VCP STRATEGY BACKTEST RESULTS")
     print("═" * 100)
-    print(f"  Universe: {len(DEFAULT_TICKERS)} S&P large-caps (survivorship bias applies)")
+    print(f"  Universe: {start_year}–{end_year} (survivorship bias applies)")
     print(f"  Period  : {start_year}–{end_year}")
     print(f"  Capital : ${initial_capital:,.0f} starting")
     print(f"  Rules   : 2% risk/trade | max 5 positions | +20% target | 7% stop | weekly scan")
@@ -754,11 +799,20 @@ def main() -> None:
     parser.add_argument("--start",   type=int,   default=2015, help="Start year (default: 2015)")
     parser.add_argument("--end",     type=int,   default=2024, help="End year (default: 2024)")
     parser.add_argument("--capital", type=float, default=10_000, help="Starting capital (default: 10000)")
-    parser.add_argument("--tickers", nargs="+",  default=None,
-                        help="Custom ticker list (default: S&P 100 large-caps)")
+    parser.add_argument("--tickers", nargs="+", default=None,
+                        help="Custom ticker list")
+    parser.add_argument("--universe", choices=["sp100", "growth"], default="sp100",
+                        help="Preset universe: sp100 (default) or growth (momentum stocks)")
     args = parser.parse_args()
 
-    tickers = args.tickers if args.tickers else DEFAULT_TICKERS
+    if args.tickers:
+        tickers = args.tickers
+    elif args.universe == "growth":
+        tickers = GROWTH_TICKERS
+        print("Using GROWTH universe ({} tickers)".format(len(tickers)))
+    else:
+        tickers = DEFAULT_TICKERS
+        print("Using S&P 100 universe ({} tickers)".format(len(tickers)))
 
     t0 = time.time()
 

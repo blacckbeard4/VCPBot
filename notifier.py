@@ -92,6 +92,25 @@ def send_vcp_signal_alert(
     return send_alert(msg)
 
 
+def send_htf_signal_alert(
+    ticker: str,
+    pivot: float,
+    stop: float,
+    rs_rank: float,
+    gain_8w_pct: float,
+    consolidation_depth_pct: float,
+    days_consolidating: int,
+) -> bool:
+    """Alert: new HTF setup queued for next-morning execution."""
+    msg = (
+        f"\U0001f6a9 <b>[HTF SETUP]: {ticker}</b>\n"
+        f"Pivot: ${pivot:.2f} | Stop: ${stop:.2f} | RS Rank: {rs_rank:.0f}\n"
+        f"8w Surge: +{gain_8w_pct:.0f}% | Consol: {consolidation_depth_pct:.1f}% / {days_consolidating}d\n"
+        f"Order queued for next morning open."
+    )
+    return send_alert(msg)
+
+
 def send_trade_alert(
     ticker: str,
     shares: float,

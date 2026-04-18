@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_reason         TEXT,
     pnl                 REAL,
     r_multiple          REAL,
-    -- VCP-specific fields
+    -- VCP/HTF-specific fields
     pivot_price         REAL,
     rs_rank             REAL,
     base_duration_weeks INTEGER,
@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS trades (
     alpaca_order_id     TEXT,
     regime_at_entry     TEXT,
     analyst_rationale   TEXT,
+    pattern_type        TEXT DEFAULT 'VCP',
     created_at          TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
@@ -142,6 +143,11 @@ def init_db() -> None:
             conn.execute("ALTER TABLE regime_state ADD COLUMN ftd_date TEXT")
             logger.info("Migrated regime_state: added ftd_date column")
         except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN pattern_type TEXT DEFAULT 'VCP'")
+            logger.info("Migrated trades: added pattern_type column")
+        except Exception:
             pass  # column already exists
         # Migration: create ticker_rejections if it doesn't exist (existing DBs)
         try:
@@ -178,6 +184,7 @@ def insert_trade(
     status: str = "PENDING",
     entry_price: Optional[float] = None,
     direction: str = "LONG",
+    pattern_type: str = "VCP",
 ) -> int:
     """Insert a trade row. Returns the trade id."""
     conn = get_conn()
@@ -186,15 +193,18 @@ def insert_trade(
             """INSERT INTO trades
                (ticker, direction, entry_price, stop_price, target_1_price,
                 shares, entry_date, status, pivot_price, rs_rank,
-                base_duration_weeks, contraction_depth_pct, regime_at_entry, analyst_rationale)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                base_duration_weeks, contraction_depth_pct,
+                regime_at_entry, analyst_rationale, pattern_type)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (ticker, direction, entry_price, stop_price, target_1_price,
              shares, entry_date, status, pivot_price, rs_rank,
-             base_duration_weeks, contraction_depth_pct, regime_at_entry, analyst_rationale),
+             base_duration_weeks, contraction_depth_pct,
+             regime_at_entry, analyst_rationale, pattern_type),
         )
         trade_id = cursor.lastrowid
     conn.close()
-    logger.info("Inserted trade %d: %s %d shares, pivot=%.2f", trade_id, ticker, shares, pivot_price)
+    logger.info("Inserted trade %d: %s [%s] %g shares, pivot=%.2f",
+                trade_id, ticker, pattern_type, shares, pivot_price)
     return trade_id
 
 

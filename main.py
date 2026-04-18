@@ -32,13 +32,14 @@ import regime as regime_mod
 from tickers import get_full_universe
 import scanner
 import vcp_detector
+import htf_detector
 import risk_manager
 import executor
 import monitor
 from notifier import (
     send_alert, send_error_alert, send_pipeline_summary,
     send_weekly_report, send_cash_mode_alert, send_cash_mode_exit_alert,
-    send_ftd_alert, send_vcp_signal_alert,
+    send_ftd_alert, send_vcp_signal_alert, send_htf_signal_alert,
 )
 
 logger = logging.getLogger(__name__)
@@ -168,19 +169,43 @@ def run_scan_pipeline() -> None:
 
     phase3_count = len(scan_results)
 
-    # ── Phase 4: VCP pattern detection ──
+    # ── Phase 4a: VCP pattern detection ──
     try:
         vcp_setups, vcp_rejections = vcp_detector.detect_vcp_batch(scan_results)
-        all_rejections.extend(vcp_rejections)
-        logger.info("Phase 4 (VCP): %d setups found", len(vcp_setups))
+        # Separate the HTF candidate sentinel from normal rejections
+        htf_candidate_tickers: list[str] = []
+        for r in vcp_rejections:
+            if r["ticker"] == "__HTF_CANDIDATES__":
+                htf_candidate_tickers = r["reason"].split(",") if r["reason"] else []
+            else:
+                all_rejections.append(r)
+        logger.info("Phase 4a (VCP): %d setups, %d HTF candidates",
+                    len(vcp_setups), len(htf_candidate_tickers))
     except Exception as e:
         logger.error("VCP detection failed: %s", e)
         db.log_error("vcp_detector", str(type(e).__name__), str(e), traceback_str=traceback.format_exc())
         vcp_setups = []
+        htf_candidate_tickers = []
 
     gc.collect()
 
-    if not vcp_setups:
+    # ── Phase 4b: HTF pattern detection ──
+    try:
+        htf_setups, htf_rejections = htf_detector.detect_htf_batch(
+            scan_results, htf_candidate_tickers
+        )
+        all_rejections.extend(htf_rejections)
+        logger.info("Phase 4b (HTF): %d setups found", len(htf_setups))
+    except Exception as e:
+        logger.error("HTF detection failed: %s", e)
+        db.log_error("htf_detector", str(type(e).__name__), str(e), traceback_str=traceback.format_exc())
+        htf_setups = []
+
+    gc.collect()
+
+    all_setups = vcp_setups + htf_setups
+
+    if not all_setups:
         db.bulk_insert_rejections(today, all_rejections)
         db.insert_scan_log(
             run_date=today, regime=regime["regime_label"],
@@ -196,7 +221,7 @@ def run_scan_pipeline() -> None:
 
     try:
         decisions = risk_manager.compute_position_sizes(
-            vcp_setups=vcp_setups,
+            vcp_setups=all_setups,
             open_positions=open_positions,
             account_value=live_account_value,
             ftd_mode=ftd_mode,
@@ -223,10 +248,12 @@ def run_scan_pipeline() -> None:
             continue
         ticker = decision["ticker"]
 
-        # Find matching VCP setup for full details
-        setup = next((s for s in vcp_setups if s["ticker"] == ticker), None)
+        # Find matching setup (VCP first, then HTF)
+        setup = next((s for s in all_setups if s["ticker"] == ticker), None)
         if setup is None:
             continue
+
+        pattern = setup.get("pattern_type", "VCP")
 
         trade_id = db.insert_trade(
             ticker=ticker,
@@ -241,16 +268,28 @@ def run_scan_pipeline() -> None:
             regime_at_entry=regime["regime_label"],
             analyst_rationale=decision["reason"],
             status="PENDING" if not DRY_RUN else "DRY_RUN",
+            pattern_type=pattern,
         )
 
-        send_vcp_signal_alert(
-            ticker=ticker,
-            pivot=decision["pivot_price"],
-            stop=decision["stop_price"],
-            rs_rank=decision["rs_rank"],
-            base_weeks=decision["base_duration_weeks"],
-            contractions=decision["contraction_depths"],
-        )
+        if pattern == "HTF":
+            send_htf_signal_alert(
+                ticker=ticker,
+                pivot=decision["pivot_price"],
+                stop=decision["stop_price"],
+                rs_rank=decision["rs_rank"],
+                gain_8w_pct=setup.get("gain_8w_pct", 0.0),
+                consolidation_depth_pct=setup.get("consolidation_depth_pct", 0.0),
+                days_consolidating=setup.get("days_consolidating", 0),
+            )
+        else:
+            send_vcp_signal_alert(
+                ticker=ticker,
+                pivot=decision["pivot_price"],
+                stop=decision["stop_price"],
+                rs_rank=decision["rs_rank"],
+                base_weeks=decision["base_duration_weeks"],
+                contractions=decision["contraction_depths"],
+            )
 
         # Log to CSV at signal time (entry price not known yet)
         db.log_trade_to_csv(
@@ -274,7 +313,7 @@ def run_scan_pipeline() -> None:
         tickers_scanned=len(universe),
         tickers_phase2=phase3_count,
         tickers_phase3=phase3_count,
-        vcp_setups=len(vcp_setups),
+        vcp_setups=len(vcp_setups) + len(htf_setups),
         orders_queued=orders_queued,
     )
 
@@ -284,13 +323,13 @@ def run_scan_pipeline() -> None:
         tickers_scanned=len(universe),
         tickers_phase2=phase3_count,
         tickers_phase3=phase3_count,
-        vcp_setups=len(vcp_setups),
+        vcp_setups=len(vcp_setups) + len(htf_setups),
         orders_queued=orders_queued,
     )
 
     logger.info(
-        "PIPELINE COMPLETE: universe=%d, phase3=%d, vcp=%d, queued=%d%s",
-        len(universe), phase3_count, len(vcp_setups), orders_queued,
+        "PIPELINE COMPLETE: universe=%d, phase3=%d, vcp=%d, htf=%d, queued=%d%s",
+        len(universe), phase3_count, len(vcp_setups), len(htf_setups), orders_queued,
         " [DRY RUN — no orders placed]" if DRY_RUN else "",
     )
 
