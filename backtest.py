@@ -39,8 +39,9 @@ import news as _news_mod
 _news_mod.has_earnings_blackout = lambda ticker: False  # skip — can't backtest historically
 
 from vcp_detector import detect_vcp
+from htf_detector import detect_htf
 from config import (
-    MIN_AVG_VOLUME, MIN_PRICE, RS_MIN_RANK,
+    MIN_AVG_VOLUME, MIN_PRICE, RS_RANK_CURRENT_MIN,
     MIN_PCT_ABOVE_52W_LOW, MAX_PCT_BELOW_52W_HIGH,
     BUY_STOP_OFFSET, TARGET_PCT, MAX_STOP_PCT,
     RISK_PCT_NORMAL, MAX_OPEN_POSITIONS,
@@ -531,7 +532,7 @@ def run_backtest(
                 continue
 
             rs_rank = rs_percentile(rs_scores[ticker])
-            if rs_rank < RS_MIN_RANK:
+            if rs_rank < RS_RANK_CURRENT_MIN:
                 continue
 
             tk_df = data[ticker]
@@ -546,20 +547,35 @@ def run_backtest(
             if not _passes_trend_template(tk_slice):
                 continue
 
-            # VCP detection
+            # VCP detection first, then HTF fallback
+            setup = None
+            pattern_type = None
             try:
                 vcp, _ = detect_vcp(ticker, tk_slice)
+                if vcp is not None:
+                    setup = vcp
+                    pattern_type = "VCP"
             except Exception:
-                continue
+                pass
 
-            if vcp is None:
+            if setup is None:
+                try:
+                    htf, _ = detect_htf(ticker, tk_slice)
+                    if htf is not None:
+                        setup = htf
+                        pattern_type = "HTF"
+                except Exception:
+                    pass
+
+            if setup is None:
                 continue
 
             candidates.append({
-                "ticker":   ticker,
-                "rs_rank":  rs_rank,
-                "scan_idx": tk_loc,
-                "vcp":      vcp,
+                "ticker":       ticker,
+                "rs_rank":      rs_rank,
+                "scan_idx":     tk_loc,
+                "vcp":          setup,
+                "pattern_type": pattern_type,
             })
 
         # Sort by RS rank (best first)
@@ -567,10 +583,11 @@ def run_backtest(
 
         # ── Step 5: Simulate entries for top candidates ──
         for cand in candidates[:slots_available]:
-            ticker   = cand["ticker"]
-            vcp      = cand["vcp"]
-            scan_idx = cand["scan_idx"]
-            tk_df    = data[ticker]
+            ticker       = cand["ticker"]
+            vcp          = cand["vcp"]
+            scan_idx     = cand["scan_idx"]
+            pattern_type = cand["pattern_type"]
+            tk_df        = data[ticker]
 
             pivot       = vcp["pivot_price"]
             stop        = vcp["stop_loss_price"]
@@ -598,19 +615,20 @@ def run_backtest(
                 shares = round((equity * 0.40) / entry_price, 4)
 
             open_positions.append({
-                "ticker":       ticker,
-                "entry_date":   str(entry_dt.date()),
-                "entry_price":  round(entry_price, 2),
-                "stop_price":   round(stop, 2),
-                "target_price": round(target, 2),
-                "shares":       shares,
-                "risk_amount":  risk_amount,
-                "rs_rank":      cand["rs_rank"],
-                "base_weeks":   vcp["base_duration_weeks"],
-                "contractions": vcp["contraction_depths"],
-                "entry_idx":    entry_idx,
+                "ticker":        ticker,
+                "entry_date":    str(entry_dt.date()),
+                "entry_price":   round(entry_price, 2),
+                "stop_price":    round(stop, 2),
+                "target_price":  round(target, 2),
+                "shares":        shares,
+                "risk_amount":   risk_amount,
+                "rs_rank":       cand["rs_rank"],
+                "base_weeks":    vcp["base_duration_weeks"],
+                "contractions":  vcp["contraction_depths"],
+                "pattern_type":  pattern_type,
+                "entry_idx":     entry_idx,
                 "last_check_idx": entry_idx,
-                "year":         entry_dt.year,
+                "year":          entry_dt.year,
             })
 
             cooldowns[ticker] = entry_dt + timedelta(days=30)
@@ -778,6 +796,18 @@ def print_report(
     print(f"  Max drawdown      : {max_dd:.1f}%")
     print(f"\n  SPY buy-and-hold  : {spy_total:+.1f}% total | CAGR {spy_cagr:+.1f}%")
     print(f"  Alpha vs SPY      : {total_return - spy_total:+.1f}% total | CAGR {cagr - spy_cagr:+.1f}%")
+
+    # ── Pattern type breakdown ──
+    if "pattern_type" in df.columns:
+        print(f"\n  Pattern breakdown:")
+        for pt, grp in df.groupby("pattern_type"):
+            grp_closed = grp[grp["exit_reason"] != "OPEN_AT_END"]
+            g_wins = grp_closed[grp_closed["pnl"] > 0]
+            g_wr = len(g_wins) / len(grp_closed) * 100 if len(grp_closed) > 0 else 0
+            g_avg_w = g_wins["pnl"].mean() if len(g_wins) > 0 else 0
+            g_pnl = grp_closed["pnl"].sum()
+            print(f"    [{pt}] {len(grp_closed):>4} trades | win%={g_wr:.0f}% | "
+                  f"avg win ${g_avg_w:+,.0f} | net P&L ${g_pnl:+,.0f}")
 
     # ── Exit reason breakdown ──
     print(f"\n  Exit reasons:")
