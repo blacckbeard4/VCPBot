@@ -100,14 +100,27 @@ Percentile-ranked across full screened universe. **Reject if RS_Rank < 80.**
 Sector cap: if a sector already has MAX_SECTOR_POSITIONS open positions, new setups
 from that sector are rejected at scan time (not just at order placement).
 
-### Phase 4 — VCP Pattern Detection
-1. Base duration >= 4 weeks (52-week high must be >= 4 weeks ago)
-2. Next earnings > 14 calendar days away
-3. 2-4 contractions, each shallower than the last (tightening)
-4. Final contraction < 8% depth (high to low)
-5. Volume dry-up during final contraction (avg < 50-day avg volume)
-6. Pivot = highest high in the final contraction range
-7. Stop = low of the final contraction (max 7% below **pivot** — reject if wider)
+### Phase 4 — VCP Pattern Detection (3-tier hierarchical)
+
+Pass 1 — Macro (n=15): Left Side High detection
+- Requires ≥30% prior uptrend into LSH
+- Requires ≥15% pullback after LSH
+- Base duration from LSH to today ≥ 20 trading days
+
+Pass 2 — Contraction (n=adaptive 3/5/8 by base length)
+- Min contraction depth filter: 3% standard, 5% for very-high ATR (>5%)
+- Requires 2–6 contractions above minimum depth
+- Rule 1: Final contraction must be the absolute tightest in sequence
+- Rule 2: If 3+ contractions, regression slope across depths must be negative
+- Rule 3: Final contraction must be < 85% of first contraction (compression ratio)
+- Final contraction absolute ceiling: 10% standard, 12% high-beta (ATR > 3.5%)
+- Volume dry-up: avg vol in final contraction ≤ 80% of 50d avg (≤8% depth)
+  or ≤ 50% of 50d avg (8–12% depth)
+
+Pass 3 — Micro (n=3): exact pivot + stop
+- Pivot = highest high in post-contraction window
+- Stop = lowest low in post-contraction window
+- Stop must be ≤ 7% below pivot (reject if wider)
 
 ### Phase 5 — Risk Calculation
 - `risk_per_trade = account_equity × risk_pct`
@@ -182,6 +195,12 @@ sudo journalctl -u trading-bot -f
 - FTD logic uses day-over-day close/volume (no intraday data) — approximation
 - VCP swing detection uses n=3 bars each side — tune SWING_PIVOT_BARS in config.py
 - Sector lookup in scanner uses yfinance LRU cache (maxsize=2048) — ~1s per new ticker
+- VCP detector uses regression slope (not strict monotonic) for tightening validation —
+  one intermediate wider swing (shakeout) is tolerated provided final is tightest
+- min_depth filter eliminates micro-swings before contraction counting —
+  tune via ATR thresholds in detect_vcp() if signal count is too low/high
+- Backtest on survivorship-biased universe underestimates live signal frequency
+  by ~16x (187 tickers vs 3,000+ live). Validate on paper trading, not backtest count.
 
 ## Build Status
 | File | Status | Notes |
@@ -203,15 +222,12 @@ sudo journalctl -u trading-bot -f
 | AGENTS.md | DONE | Agent instructions updated |
 
 ## SESSION HANDOFF
-**Last updated**: 2026-04-05 — Full QC pass + audit complete.
+**Last updated**: 2026-04-18 — Phase 4 threshold calibration.
 
 Changes applied today:
-1. Fix 1: regime.py — post-FTD 3-session distribution window + QQQ check + Day1 intraday low
-2. Fix 2: executor.py — 10:30 AM RVOL < 1.5x cancellation
-3. Verify 1: scanner.py — MAX_SECTOR_POSITIONS enforced at scan time
-4. Verify 2: monitor.py/notifier.py — expectancy auto-calc on every trade close
-5. QC: risk_manager.py — stop_pct denominator fixed (pivot, not entry_price)
-6. QC: config.py — 10 dead legacy vars removed
-7. QC: news.py — dead check_news() block removed
-8. QC: tickers.py — dead SECTOR_MAP / get_sector() removed
-9. Audit: pullbackbot.db, analyst.py, planner.py, backtest.py, 2 empty CSVs deleted
+1. vcp_detector.py — min_depth tiered: 0.03 standard / 0.05 very-high-ATR (>5%)
+2. vcp_detector.py — compression ratio threshold loosened: 0.75 → 0.85
+3. vcp_detector.py — 3-rule tightening system (regression slope replaces strict monotonic)
+4. Backtest validated: 27 Phase 4 passes on 187-ticker universe over 10 years;
+   0 passes in bear years 2015/2018/2022 confirms regime filter working correctly
+5. CLAUDE.md — Phase 4 rules updated to reflect current implementation

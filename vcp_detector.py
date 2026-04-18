@@ -30,7 +30,9 @@ import pandas as pd
 
 from config import (
     MIN_BASE_DAYS, EARNINGS_BLACKOUT_DAYS,
-    MAX_FINAL_CONTRACTION_PCT, MIN_CONTRACTIONS, MAX_CONTRACTIONS,
+    MAX_FINAL_CONTRACTION_STANDARD, MAX_FINAL_CONTRACTION_HIGH_BETA,
+    VOLUME_DRY_STANDARD_PCT, VOLUME_DRY_STRICT_PCT,
+    MIN_CONTRACTIONS, MAX_CONTRACTIONS,
     SWING_MACRO_N, SWING_CONTRACTION_N, SWING_MICRO_N,
     LSH_MIN_PULLBACK_PCT, PRIOR_UPTREND_MIN_PCT, MAX_STOP_PCT,
 )
@@ -65,6 +67,29 @@ def find_swing_lows(low: pd.Series, n: int) -> list[int]:
 
 
 # ═══════════════════════════════════════════════════════════
+# ATR HELPER
+# ═══════════════════════════════════════════════════════════
+
+
+def _compute_atr_pct(df: pd.DataFrame, period: int = 14) -> float:
+    """ATR-14 as percentage of current close price."""
+    if len(df) < period + 1:
+        return 0.0
+    close = df["Close"].values
+    high  = df["High"].values
+    low   = df["Low"].values
+    tr_vals = []
+    for i in range(len(df) - period, len(df)):
+        hl = high[i] - low[i]
+        hc = abs(high[i] - close[i - 1])
+        lc = abs(low[i]  - close[i - 1])
+        tr_vals.append(max(hl, hc, lc))
+    atr = sum(tr_vals) / len(tr_vals)
+    close_now = float(close[-1])
+    return (atr / close_now * 100) if close_now > 0 else 0.0
+
+
+# ═══════════════════════════════════════════════════════════
 # PASS 1 — MACRO: Left Side High + base boundary
 # ═══════════════════════════════════════════════════════════
 
@@ -89,37 +114,42 @@ def _find_left_side_high(
         return None, "no macro swing highs found (n={})".format(n)
 
     # Walk backwards through macro highs — most recent first
+    last_rejection = ""
     for sh_idx in reversed(macro_highs):
         sh_price = float(high.iloc[sh_idx])
 
-        # ── Check prior uptrend into this high ──
-        # Look up to 252 bars before the high for a swing low to measure from
+        # ── Check prior uptrend into this high (CHANGE 3) ──
         lookback_start = max(0, sh_idx - 252)
         prior_lows_idx = find_swing_lows(low.iloc[lookback_start:sh_idx + 1], n)
         if not prior_lows_idx:
+            last_rejection = "no prior swing low found within 252 bars | NO_PRIOR_UPTREND"
             continue
-        # Prior swing low price (global low in that window)
         prior_low_price = float(low.iloc[lookback_start:sh_idx].min())
         if prior_low_price <= 0:
+            last_rejection = "invalid prior low price | NO_PRIOR_UPTREND"
             continue
         advance_pct = (sh_price - prior_low_price) / prior_low_price
         if advance_pct < PRIOR_UPTREND_MIN_PCT:
-            continue  # insufficient prior uptrend into this high
+            last_rejection = (
+                f"advance into high {advance_pct:.0%} < {PRIOR_UPTREND_MIN_PCT:.0%} required "
+                f"| NO_PRIOR_UPTREND"
+            )
+            continue
 
         # ── Check pullback after the high ──
-        # Find the lowest price between sh_idx and end of data
         post_low = float(low.iloc[sh_idx + 1:].min()) if sh_idx + 1 < len(low) else sh_price
         pullback_pct = (sh_price - post_low) / sh_price
         if pullback_pct < LSH_MIN_PULLBACK_PCT:
-            continue  # not enough pullback after this high — not an LSH
+            last_rejection = (
+                f"pullback after high {pullback_pct:.0%} < {LSH_MIN_PULLBACK_PCT:.0%} required "
+                f"| INSUFFICIENT_PULLBACK"
+            )
+            continue
 
         return sh_idx, ""
 
-    return None, (
-        f"no macro swing high qualified as LSH "
-        f"(need >={LSH_MIN_PULLBACK_PCT:.0%} pullback after, "
-        f">={PRIOR_UPTREND_MIN_PCT:.0%} advance before)"
-    )
+    reason = last_rejection or "no macro swing highs found"
+    return None, f"LSH not found | {len(macro_highs)} highs checked | {reason} | NO_LSH"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -130,6 +160,7 @@ def _find_left_side_high(
 def _build_contractions_in_base(
     base_df: pd.DataFrame,
     n: int = SWING_CONTRACTION_N,
+    min_depth: float = 0.03,   # ignore swings shallower than 3%
 ) -> list[dict]:
     """Find swing high→low contraction pairs within the base window.
 
@@ -156,7 +187,11 @@ def _build_contractions_in_base(
             continue
         sl_idx   = subsequent[0]
         sl_price = float(low.iloc[sl_idx])
+        if sl_price >= sh_price:
+            continue   # no real pullback (stock in uptrend past this high)
         depth    = (sh_price - sl_price) / sh_price
+        if depth < min_depth:
+            continue   # ignore micro-oscillations — not a structural contraction
 
         contractions.append({
             "sh_idx":   sh_idx,
@@ -181,15 +216,17 @@ def _micro_pivot_stop(
     final_contraction: dict,
     n: int = SWING_MICRO_N,
 ) -> tuple[float, float]:
-    """Within the final contraction window, use n=SWING_MICRO_N to find:
-      pivot = highest high (used for order placement)
-      stop  = lowest low  (stop loss)
+    """Find exact entry pivot and stop within the post-contraction consolidation.
 
-    Falls back to the contraction's sh_price/sl_price if no micro pivots found.
+    Window starts at the final swing LOW (sl_idx) — i.e. the tight range AFTER
+    the last pullback, not from the swing high.  This prevents deep prior lows
+    from inflating the stop distance when the stock has rallied back from the low.
     """
-    sh_idx = final_contraction["sh_idx"]
-    # Window: from final contraction's swing high to end of base_df
-    window = base_df.iloc[sh_idx:]
+    sl_idx = final_contraction["sl_idx"]
+    window = base_df.iloc[sl_idx:]          # post-contraction consolidation
+
+    if len(window) == 0:
+        return final_contraction["sh_price"], final_contraction["sl_price"]
 
     pivot = float(window["High"].max())
     stop  = float(window["Low"].min())
@@ -231,98 +268,198 @@ def detect_vcp(ticker: str, df: pd.DataFrame) -> tuple[Optional[dict], str]:
     base_duration_days = len(df) - 1 - lsh_idx
     if base_duration_days < MIN_BASE_DAYS:
         return None, (
-            f"base too short ({base_duration_days}d < {MIN_BASE_DAYS}d required — "
-            f"LSH was {base_duration_days} trading days ago)"
+            f"VCP_REJECT | base={base_duration_days}d < {MIN_BASE_DAYS}d required | "
+            f"BASE_TOO_SHORT (LSH was {base_duration_days} trading days ago)"
         )
 
     base_df = df.iloc[lsh_idx:]
 
-    # ── Pass 2: Find contractions within base ──
-    contractions = _build_contractions_in_base(base_df, n=SWING_CONTRACTION_N)
+    # ── ATR (computed once, used for min_depth and ceiling checks) ──
+    atr_pct   = _compute_atr_pct(df)
+    if atr_pct > 5.0:
+        min_depth = 0.05   # very high ATR: filter below 5%
+    else:
+        min_depth = 0.03   # standard + high ATR: filter below 3%
+
+    # ── Pass 2: Adaptive contraction detection (CHANGE 1) ──
+    # Shorter bases can't support n=8 swings — scale n with base length
+    if base_duration_days >= 60:
+        contraction_n = SWING_CONTRACTION_N   # 8 — long bases, full sensitivity
+    elif base_duration_days >= 35:
+        contraction_n = 5                      # medium bases
+    else:
+        contraction_n = 3                      # short bases (4–7 weeks)
+
+    contractions = _build_contractions_in_base(base_df, n=contraction_n, min_depth=min_depth)
+
+    # ── Contraction count gate ──
+    is_vcp_1c      = False
+    pivot_price    = None
+    stop_loss_price = None
+    micro_depth_1c = None
 
     if len(contractions) < MIN_CONTRACTIONS:
-        return None, (
-            f"too few contractions ({len(contractions)} found in base, "
-            f"need {MIN_CONTRACTIONS})"
-        )
-
-    # Take the last MAX_CONTRACTIONS contractions
-    recent = contractions[-MAX_CONTRACTIONS:]
-    if len(recent) < MIN_CONTRACTIONS:
-        return None, f"too few recent contractions ({len(recent)})"
-
-    # Verify tightening
-    depths = [c["depth"] for c in recent]
-    for i in range(1, len(depths)):
-        if depths[i] >= depths[i - 1]:
+        # VCP_1C path: accept single contraction when base is short
+        # and the post-contraction range is ≥40% tighter (≤60% of single depth)
+        if len(contractions) == 1 and base_duration_days < 35:
+            single   = contractions[0]
+            sl_start = single["sl_idx"]       # index within base_df
+            post_sl  = base_df.iloc[sl_start:]
+            if len(post_sl) < 3:
+                return None, (
+                    f"VCP_REJECT | base={base_duration_days}d | "
+                    f"contractions=[{single['depth']:.1%}] | "
+                    f"post-contraction only {len(post_sl)} bars | VCP_1C_MICRO_FAIL"
+                )
+            tight_pivot = float(post_sl["High"].max())
+            tight_stop  = float(post_sl["Low"].min())
+            micro_depth_1c = (tight_pivot - tight_stop) / tight_pivot if tight_pivot > 0 else 1.0
+            required = single["depth"] * 0.60  # must be ≥40% shallower
+            if micro_depth_1c > required:
+                return None, (
+                    f"VCP_REJECT | base={base_duration_days}d | "
+                    f"contractions=[{single['depth']:.1%}] | "
+                    f"micro={micro_depth_1c:.1%} > 60%×{single['depth']:.1%}={required:.1%} | "
+                    f"VCP_1C_MICRO_FAIL"
+                )
+            is_vcp_1c       = True
+            recent          = [single]
+            pivot_price     = round(tight_pivot, 2)
+            stop_loss_price = round(tight_stop, 2)
+        else:
             return None, (
-                f"not tightening: contraction {i} depth "
-                f"{depths[i]:.1%} >= prior {depths[i-1]:.1%}"
+                f"VCP_REJECT | base={base_duration_days}d | "
+                f"too few contractions ({len(contractions)} found in base, "
+                f"need {MIN_CONTRACTIONS}) | NOT_ENOUGH_CONTRACTIONS"
+            )
+    else:
+        # Standard VCP_2C+ path
+        recent = contractions[-MAX_CONTRACTIONS:]
+        if len(recent) < MIN_CONTRACTIONS:
+            return None, (
+                f"VCP_REJECT | base={base_duration_days}d | "
+                f"too few recent contractions ({len(recent)}) | NOT_ENOUGH_CONTRACTIONS"
             )
 
-    # Final contraction depth check
-    final_depth = depths[-1]
-    if final_depth >= MAX_FINAL_CONTRACTION_PCT:
-        return None, (
-            f"final contraction {final_depth:.1%} >= "
-            f"{MAX_FINAL_CONTRACTION_PCT:.0%} max"
+        depths = [c["depth"] for c in recent]
+
+        # Rule 1: Final contraction must be the tightest (absolute requirement)
+        if depths[-1] != min(depths):
+            return None, (
+                f"VCP_REJECT | base={base_duration_days}d | "
+                f"contractions={[f'{d:.1%}' for d in depths]} | "
+                f"final={depths[-1]:.1%} is not the tightest | FINAL_NOT_TIGHTEST"
+            )
+
+        # Rule 2: Overall trend must be compressing (regression slope negative)
+        if len(depths) >= 3:
+            x     = np.arange(len(depths), dtype=float)
+            slope = np.polyfit(x, depths, 1)[0]
+            if slope >= 0:
+                return None, (
+                    f"VCP_REJECT | base={base_duration_days}d | "
+                    f"contractions={[f'{d:.1%}' for d in depths]} | "
+                    f"regression slope={slope:.4f} >= 0 (not compressing) | NOT_COMPRESSING"
+                )
+
+        # Rule 3: Final must be meaningfully tighter than the first
+        # (prevents final=9.8% qualifying when first=10% — essentially flat base)
+        if len(depths) >= 2:
+            compression_ratio = depths[-1] / depths[0]
+            if compression_ratio > 0.85:
+                return None, (
+                    f"VCP_REJECT | base={base_duration_days}d | "
+                    f"contractions={[f'{d:.1%}' for d in depths]} | "
+                    f"compression_ratio={compression_ratio:.2f} > 0.85 (insufficient compression) | "
+                    f"INSUFFICIENT_COMPRESSION"
+                )
+
+    # ── Pass 3: Micro pivot + stop for VCP_2C+ ──
+    if not is_vcp_1c:
+        pivot_price, stop_loss_price = _micro_pivot_stop(
+            base_df, recent[-1], n=SWING_MICRO_N
         )
 
-    # ── Pass 3: Micro pivot + stop in final contraction window ──
-    pivot_price, stop_loss_price = _micro_pivot_stop(
-        base_df, recent[-1], n=SWING_MICRO_N
-    )
+    # Final contraction depth for threshold checks
+    depths_all  = [c["depth"] for c in recent]
+    final_depth = micro_depth_1c if is_vcp_1c else recent[-1]["depth"]
 
+    # ── ATR-adjusted absolute depth ceiling ──
+    max_final = (
+        MAX_FINAL_CONTRACTION_HIGH_BETA if atr_pct > 3.5
+        else MAX_FINAL_CONTRACTION_STANDARD
+    )
+    if final_depth > max_final:
+        return None, (
+            f"VCP_REJECT | base={base_duration_days}d | "
+            f"contractions={[f'{d:.1%}' for d in depths_all]} | "
+            f"final={final_depth:.1%} > {max_final:.0%} ceiling (ATR={atr_pct:.1f}%) | "
+            f"FINAL_CONTRACTION_WIDE"
+        )
+
+    # ── Stop width check ──
     stop_pct = (pivot_price - stop_loss_price) / pivot_price
     if stop_pct > MAX_STOP_PCT:
         return None, (
-            f"stop {stop_pct:.1%} below pivot (max {MAX_STOP_PCT:.0%})"
+            f"VCP_REJECT | base={base_duration_days}d | "
+            f"contractions={[f'{d:.1%}' for d in depths_all]} | "
+            f"stop={stop_pct:.1%} > {MAX_STOP_PCT:.0%} max | STOP_TOO_WIDE"
         )
 
-    # ── Volume dry-up ──
-    final_sh_idx = recent[-1]["sh_idx"]
-    final_sl_idx = recent[-1]["sl_idx"]
-    final_vol    = base_df["Volume"].iloc[final_sh_idx:final_sl_idx + 1]
-    avg_vol_50d  = (
+    # ── Volume dry-up with compensation matrix (CHANGE 2) ──
+    if is_vcp_1c:
+        vol_window = base_df["Volume"].iloc[recent[0]["sl_idx"]:]
+    else:
+        final_sh_idx = recent[-1]["sh_idx"]
+        final_sl_idx = recent[-1]["sl_idx"]
+        vol_window   = base_df["Volume"].iloc[final_sh_idx:final_sl_idx + 1]
+
+    avg_vol_50d   = (
         float(df["Volume"].iloc[-50:].mean())
         if len(df) >= 50 else float(df["Volume"].mean())
     )
-    final_avg_vol = float(final_vol.mean()) if len(final_vol) > 0 else avg_vol_50d
-    volume_dry_up = final_avg_vol < avg_vol_50d
+    final_avg_vol = float(vol_window.mean()) if len(vol_window) > 0 else avg_vol_50d
+    vol_threshold = VOLUME_DRY_STANDARD_PCT if final_depth <= 0.08 else VOLUME_DRY_STRICT_PCT
+    vol_ratio     = final_avg_vol / avg_vol_50d if avg_vol_50d > 0 else 1.0
 
-    if not volume_dry_up:
+    if vol_ratio >= vol_threshold:
         return None, (
-            f"no volume dry-up in final contraction "
-            f"(avg {final_avg_vol:,.0f} vs 50d avg {avg_vol_50d:,.0f})"
+            f"VCP_REJECT | base={base_duration_days}d | "
+            f"contractions={[f'{d:.1%}' for d in depths_all]} | "
+            f"final_depth={final_depth:.1%} | "
+            f"vol_ratio={vol_ratio:.2f} >= {vol_threshold:.2f} threshold | "
+            f"VOLUME_DRY_FAIL"
         )
 
     # ── LSH metadata ──
-    lsh_price = float(df["High"].iloc[lsh_idx])
-    lsh_date  = str(df.index[lsh_idx].date()) if hasattr(df.index, "date") else ""
-
-    base_weeks = base_duration_days // 5  # trading days → approximate weeks
+    lsh_price  = float(df["High"].iloc[lsh_idx])
+    lsh_date   = str(df.index[lsh_idx].date()) if hasattr(df.index, "date") else ""
+    base_weeks = base_duration_days // 5
+    pat_label  = "VCP_1C" if is_vcp_1c else "VCP"
 
     logger.info(
-        "VCP ✓ %s | pivot=%.2f stop=%.2f | base=%dd(%dw) | "
-        "contractions=%s | LSH=%.2f",
-        ticker, pivot_price, stop_loss_price,
+        "%s ✓ %s | pivot=%.2f stop=%.2f | base=%dd(%dw) | "
+        "contractions=%s | ATR=%.1f%% | LSH=%.2f",
+        pat_label, ticker, pivot_price, stop_loss_price,
         base_duration_days, base_weeks,
-        [f"{d:.1%}" for d in depths], lsh_price,
+        [f"{d:.1%}" for d in depths_all], atr_pct, lsh_price,
     )
 
     return {
-        "ticker":                 ticker,
-        "pivot_price":            round(pivot_price, 2),
-        "stop_loss_price":        round(stop_loss_price, 2),
-        "base_duration_days":     base_duration_days,
-        "base_duration_weeks":    base_weeks,
-        "contraction_depths":     [round(d, 4) for d in depths],
+        "ticker":                  ticker,
+        "pivot_price":             round(pivot_price, 2),
+        "stop_loss_price":         round(stop_loss_price, 2),
+        "base_duration_days":      base_duration_days,
+        "base_duration_weeks":     base_weeks,
+        "contraction_depths":      [round(d, 4) for d in depths_all],
         "final_contraction_depth": round(final_depth, 4),
-        "n_contractions":         len(recent),
-        "volume_dry_up":          volume_dry_up,
-        "lsh_price":              round(lsh_price, 2),
-        "lsh_date":               lsh_date,
-        "stop_pct_from_pivot":    round(stop_pct, 4),
+        "n_contractions":          len(recent),
+        "volume_dry_up":           True,
+        "lsh_price":               round(lsh_price, 2),
+        "lsh_date":                lsh_date,
+        "stop_pct_from_pivot":     round(stop_pct, 4),
+        "pattern_type":            pat_label,
+        "atr_pct":                 round(atr_pct, 2),
     }, ""
 
 
@@ -365,7 +502,8 @@ def detect_vcp_batch(
 
         if vcp is None:
             rejections.append({"ticker": ticker, "phase": "VCP", "reason": reason})
-            # Tag for HTF hand-off if the only failure was "too few contractions (1)"
+            # HTF hand-off: single-contraction failures on longer bases
+            # (VCP_1C path already accepted short-base single contractions)
             if "too few contractions (1" in reason:
                 single_contraction_tickers.append(ticker)
             continue
