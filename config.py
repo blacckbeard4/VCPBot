@@ -62,7 +62,11 @@ MAX_PCT_BELOW_52W_HIGH: float = 0.25   # close >= 52w_high * 0.75
 # ── VCP pattern (Phase 4) — 3-tier hierarchical pivot detection ──
 EARNINGS_BLACKOUT_DAYS: int  = 14    # reject if earnings within 14 days
 MIN_BASE_DAYS: int           = 20    # minimum base duration in trading days (≈4 weeks)
-MAX_FINAL_CONTRACTION_PCT: float = 0.08   # final contraction depth < 8%
+MAX_FINAL_CONTRACTION_STANDARD: float = 0.10  # standard ceiling: final depth < 10%
+MAX_FINAL_CONTRACTION_HIGH_BETA: float = 0.12  # high-beta ceiling (ATR > 3.5% of price)
+CONTRACTION_TIGHTENING_RATIO: float = 0.60     # final must be ≤ 60% of prior contraction
+VOLUME_DRY_STANDARD_PCT: float = 0.80          # vol ≤ 80% of 50d avg (depth ≤ 8%)
+VOLUME_DRY_STRICT_PCT: float = 0.50            # vol ≤ 50% of 50d avg (depth 8–12%)
 MIN_CONTRACTIONS: int        = 2     # minimum contraction count in base
 MAX_CONTRACTIONS: int        = 6     # maximum contraction count to inspect
 LSH_MIN_PULLBACK_PCT: float  = 0.15  # LSH must precede >=15% pullback to qualify

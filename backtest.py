@@ -26,8 +26,10 @@ Usage:
 import argparse
 import gc
 import logging
+import re
 import sys
 import time
+from collections import defaultdict
 from datetime import date, timedelta
 
 import numpy as np
@@ -109,6 +111,102 @@ GROWTH_TICKERS = [
     "CPNG", "JD", "PDD",     # international growth
     "AEHR", "AAON", "EXPO",  # hidden gems with strong VCP history
 ]
+
+
+# ═══════════════════════════════════════════════════════════
+# PHASE 4 REJECTION CATEGORISATION
+# ═══════════════════════════════════════════════════════════
+
+_REJECTION_LABELS = {
+    "final_contraction_wide":  "Final contraction too wide (>threshold)",
+    "too_few_contractions":    "Not enough contractions (<2)",
+    "tightening_ratio_fail":   "Tightening ratio fail (final > 60% of prior)",
+    "not_tightening":          "Contractions not tightening (monotonic fail)",
+    "base_too_short":          "Base too short (<20 trading days)",
+    "volume_not_dry":          "Volume not dry in final contraction",
+    "stop_too_wide":           "Stop too wide (>7% below pivot)",
+    "no_lsh":                  "No LSH found (macro pivot failed)",
+    "vcp_1c_micro_fail":       "VCP_1C: micro-pivot too loose (>60% of single contraction)",
+    "insufficient_history":    "Insufficient history",
+    "htf_surge_too_low":       "HTF: prior surge <100% in 8 weeks",
+    "htf_consol_too_wide":     "HTF: consolidation depth >20%",
+    "htf_duration_off":        "HTF: consolidation duration out of range",
+    "htf_volume_not_dry":      "HTF: volume not dry in consolidation",
+    "htf_stop_too_wide":       "HTF: stop too wide",
+    "other":                   "Other / exception",
+}
+
+_LABEL_ORDER = [
+    "final_contraction_wide",
+    "too_few_contractions",
+    "tightening_ratio_fail",
+    "not_tightening",
+    "base_too_short",
+    "volume_not_dry",
+    "stop_too_wide",
+    "no_lsh",
+    "vcp_1c_micro_fail",
+    "insufficient_history",
+    "htf_surge_too_low",
+    "htf_consol_too_wide",
+    "htf_duration_off",
+    "htf_volume_not_dry",
+    "htf_stop_too_wide",
+    "other",
+]
+
+
+def _categorise_vcp(reason: str) -> str:
+    ru = reason.upper()
+    rl = reason.lower()
+    # Tag-based matching first (new format)
+    if "FINAL_CONTRACTION_WIDE" in ru:
+        return "final_contraction_wide"
+    if "NOT_ENOUGH_CONTRACTIONS" in ru or "too few contractions" in rl or "too few recent" in rl:
+        return "too_few_contractions"
+    if "TIGHTENING_RATIO_FAIL" in ru:
+        return "tightening_ratio_fail"
+    if "NOT_TIGHTENING" in ru or "not tightening" in rl:
+        return "not_tightening"
+    if "BASE_TOO_SHORT" in ru or "base too short" in rl:
+        return "base_too_short"
+    if "VOLUME_DRY_FAIL" in ru or "no volume dry-up" in rl:
+        return "volume_not_dry"
+    if "STOP_TOO_WIDE" in ru or ("stop" in rl and "below pivot" in rl):
+        return "stop_too_wide"
+    if "NO_LSH" in ru or "lsh not found" in rl or "no macro swing" in rl:
+        return "no_lsh"
+    if "VCP_1C_MICRO_FAIL" in ru:
+        return "vcp_1c_micro_fail"
+    if "insufficient history" in rl:
+        return "insufficient_history"
+    return "other"
+
+
+def _categorise_htf(reason: str) -> str:
+    r = reason.lower()
+    if "prior surge" in r:
+        return "htf_surge_too_low"
+    if "consolidation depth" in r or "depth" in r:
+        return "htf_consol_too_wide"
+    if "outside" in r and "window" in r:
+        return "htf_duration_off"
+    if "no volume dry-up" in r:
+        return "htf_volume_not_dry"
+    if "stop" in r and "below pivot" in r:
+        return "htf_stop_too_wide"
+    return "other"
+
+
+def _extract_final_contraction_depth(reason: str) -> float | None:
+    """Pull the actual final depth % from a rejection message."""
+    # New format: "final=13.4%"
+    m = re.search(r"final=([\d.]+)%", reason, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+    # Old format: "final contraction X.X%"
+    m = re.search(r"final contraction\s+([\d.]+)%", reason, re.IGNORECASE)
+    return float(m.group(1)) if m else None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -364,8 +462,12 @@ def run_backtest(
     start_year: int,
     end_year: int,
     initial_capital: float,
-) -> tuple[list[dict], pd.Series]:
-    """Walk-forward backtest. Scans every Friday. Returns (trades, equity_curve)."""
+) -> tuple[list[dict], pd.Series, list[dict]]:
+    """Walk-forward backtest. Scans every Friday.
+
+    Returns (trades, equity_curve, phase4_rejections).
+    phase4_rejections: one dict per ticker-week that passed Phase 3 but failed Phase 4.
+    """
 
     spy_df = data.get("SPY")
     if spy_df is None:
@@ -398,9 +500,10 @@ def run_backtest(
                 scan_dates.append(dt)
     scan_dates = sorted(set(scan_dates))
 
-    equity         = initial_capital
-    equity_curve   = {}
-    all_trades     = []
+    equity            = initial_capital
+    equity_curve      = {}
+    all_trades        = []
+    phase4_rejections: list[dict] = []
     open_positions: list[dict] = []   # active positions
     cooldowns:      dict[str, pd.Timestamp] = {}  # ticker → cooldown_until
 
@@ -547,27 +650,43 @@ def run_backtest(
             if not _passes_trend_template(tk_slice):
                 continue
 
-            # VCP detection first, then HTF fallback
+            # ── Phase 4: VCP then HTF, capturing rejection reasons ──
             setup = None
             pattern_type = None
+            vcp_reason = ""
+            htf_reason = ""
+
             try:
-                vcp, _ = detect_vcp(ticker, tk_slice)
+                vcp, vcp_reason = detect_vcp(ticker, tk_slice)
                 if vcp is not None:
                     setup = vcp
-                    pattern_type = "VCP"
-            except Exception:
-                pass
+                    pattern_type = vcp.get("pattern_type", "VCP")  # VCP or VCP_1C
+            except Exception as e:
+                vcp_reason = f"exception: {e}"
 
             if setup is None:
                 try:
-                    htf, _ = detect_htf(ticker, tk_slice)
+                    htf, htf_reason = detect_htf(ticker, tk_slice)
                     if htf is not None:
                         setup = htf
                         pattern_type = "HTF"
-                except Exception:
-                    pass
+                except Exception as e:
+                    htf_reason = f"exception: {e}"
 
             if setup is None:
+                # Record the rejection — primary reason is VCP's
+                vcp_cat = _categorise_vcp(vcp_reason)
+                final_depth = None
+                if vcp_cat == "final_contraction_wide":
+                    final_depth = _extract_final_contraction_depth(vcp_reason)
+                phase4_rejections.append({
+                    "ticker":       ticker,
+                    "scan_date":    scan_dt,
+                    "vcp_reason":   vcp_reason,
+                    "vcp_category": vcp_cat,
+                    "htf_reason":   htf_reason,
+                    "final_depth":  final_depth,
+                })
                 continue
 
             candidates.append({
@@ -656,7 +775,7 @@ def run_backtest(
         equity += pnl
 
     equity_curve[max(equity_curve.keys()) if equity_curve else scan_dates[-1]] = equity
-    return all_trades, pd.Series(equity_curve)
+    return all_trades, pd.Series(equity_curve), phase4_rejections
 
 
 # ═══════════════════════════════════════════════════════════
@@ -797,16 +916,19 @@ def print_report(
     print(f"\n  SPY buy-and-hold  : {spy_total:+.1f}% total | CAGR {spy_cagr:+.1f}%")
     print(f"  Alpha vs SPY      : {total_return - spy_total:+.1f}% total | CAGR {cagr - spy_cagr:+.1f}%")
 
-    # ── Pattern type breakdown ──
+    # ── Pattern type breakdown (VCP, VCP_1C, HTF separately) ──
     if "pattern_type" in df.columns:
         print(f"\n  Pattern breakdown:")
-        for pt, grp in df.groupby("pattern_type"):
+        for pt in ["VCP", "VCP_1C", "HTF"]:
+            grp = df[df["pattern_type"] == pt]
+            if grp.empty:
+                continue
             grp_closed = grp[grp["exit_reason"] != "OPEN_AT_END"]
             g_wins = grp_closed[grp_closed["pnl"] > 0]
-            g_wr = len(g_wins) / len(grp_closed) * 100 if len(grp_closed) > 0 else 0
+            g_wr   = len(g_wins) / len(grp_closed) * 100 if len(grp_closed) > 0 else 0
             g_avg_w = g_wins["pnl"].mean() if len(g_wins) > 0 else 0
-            g_pnl = grp_closed["pnl"].sum()
-            print(f"    [{pt}] {len(grp_closed):>4} trades | win%={g_wr:.0f}% | "
+            g_pnl   = grp_closed["pnl"].sum()
+            print(f"    [{pt:<6}] {len(grp_closed):>4} trades | win%={g_wr:.0f}% | "
                   f"avg win ${g_avg_w:+,.0f} | net P&L ${g_pnl:+,.0f}")
 
     # ── Exit reason breakdown ──
@@ -817,6 +939,83 @@ def print_report(
         print(f"    {reason:<18}: {cnt:>4} trades ({pct:.0f}%) | avg P&L ${avg_pnl:+,.0f}")
 
     print("\n" + "═" * 100 + "\n")
+
+
+# ═══════════════════════════════════════════════════════════
+# REJECTION BREAKDOWN REPORT
+# ═══════════════════════════════════════════════════════════
+
+
+def print_rejection_report(
+    phase4_rejections: list[dict],
+    phase4_passes: int,
+) -> None:
+    """Print Phase 4 rejection breakdown + final contraction depth distribution."""
+    if not phase4_rejections:
+        print("No Phase 4 rejections recorded.\n")
+        return
+
+    total = len(phase4_rejections)
+
+    # Count by VCP category
+    counts: dict[str, int] = defaultdict(int)
+    for r in phase4_rejections:
+        counts[r["vcp_category"]] += 1
+
+    phase3_total = total + phase4_passes
+
+    sep = "─" * 65
+    print("\n" + "═" * 65)
+    print(" Phase 4 Rejection Breakdown (10-year backtest, all tickers)")
+    print("═" * 65)
+    print(f"{'Reason':<42} {'Count':>6}  {'% of Ph3':>9}")
+    print(sep)
+
+    for key in _LABEL_ORDER:
+        if key not in counts:
+            continue
+        cnt = counts[key]
+        label = _REJECTION_LABELS[key]
+        pct = cnt / phase3_total * 100 if phase3_total > 0 else 0
+        print(f"{label:<42} {cnt:>6}  {pct:>8.1f}%")
+
+    print(sep)
+    print(f"{'Total Phase 3 passes':<42} {phase3_total:>6}")
+    print(f"{'Total Phase 4 passes (trades taken)':<42} {phase4_passes:>6}")
+    print(f"{'Total Phase 4 rejections':<42} {total:>6}")
+
+    # ── Final contraction depth distribution ──
+    depth_vals = [
+        r["final_depth"]
+        for r in phase4_rejections
+        if r["vcp_category"] == "final_contraction_wide" and r["final_depth"] is not None
+    ]
+
+    if not depth_vals:
+        print("\nNo 'final contraction too wide' rejections with parseable depths.\n")
+        return
+
+    bins = [
+        ("8–10%",  8.0,  10.0),
+        ("10–12%", 10.0, 12.0),
+        ("12–15%", 12.0, 15.0),
+        ("15–20%", 15.0, 20.0),
+        (">20%",   20.0, float("inf")),
+    ]
+
+    print(f"\n  Final contraction depth distribution")
+    print(f"  (setups that passed everything else, failed only on >8% threshold)")
+    print(f"  Total in this group: {len(depth_vals)}")
+    print()
+
+    cumulative = 0
+    for label, lo, hi in bins:
+        cnt = sum(1 for d in depth_vals if lo <= d < hi)
+        cumulative += cnt
+        extra_trades = f"  → {cumulative} extra trades if threshold ≥{hi:.0f}%" if hi != float("inf") else f"  → {cumulative} extra trades total if no depth limit"
+        print(f"  {label:<8}: {cnt:>5} setups{extra_trades}")
+
+    print()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -850,7 +1049,7 @@ def main() -> None:
     data = download_data(tickers, args.start, args.end)
 
     # 2. Run backtest
-    trades, equity_curve = run_backtest(
+    trades, equity_curve, phase4_rejections = run_backtest(
         tickers=[t for t in tickers if t in data],
         data=data,
         start_year=args.start,
@@ -866,6 +1065,12 @@ def main() -> None:
         initial_capital=args.capital,
         start_year=args.start,
         end_year=args.end,
+    )
+
+    # 4. Phase 4 rejection breakdown
+    print_rejection_report(
+        phase4_rejections=phase4_rejections,
+        phase4_passes=len([t for t in trades if t.get("exit_reason") != "OPEN_AT_END"]) + len([t for t in trades if t.get("exit_reason") == "OPEN_AT_END"]),
     )
 
     elapsed = time.time() - t0
